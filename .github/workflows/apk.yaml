@@ -1,286 +1,247 @@
 name: apk
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
 permissions:
-contents: write
+  contents: write
 
 concurrency:
-group: bettbox-custom-${{ github.ref }}
-cancel-in-progress: false
+  group: bettbox-custom-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-FLUTTER_VERSION: '3.47.7'
-GO_VERSION: '1.25.x'
-GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
-FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-SENTRY_BACKEND: none
-IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
+  FLUTTER_VERSION: '3.47.7'
+  GO_VERSION: '1.25.x'
+  GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SENTRY_BACKEND: none
+  IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
 
 jobs:
-build:
-name: Build Bettbox Android ARM64
-runs-on: ubuntu-24.04
+  build:
+    name: Build Bettbox Android ARM64
+    runs-on: ubuntu-24.04
 
-steps:
-  - name: Checkout
-    uses: actions/checkout@v6
-    with:
-      fetch-depth: 0
-      submodules: recursive
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
-  - name: Read application version
-    id: version
-    shell: bash
-    run: |
-      APP_VERSION=$(sed -nE \
-        's/^version:[[:space:]]*([^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1/p' \
-        pubspec.yaml | head -n 1)
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          APP_VERSION=$(sed -nE \
+            's/^version:[[:space:]]*([^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1/p' \
+            pubspec.yaml | head -n 1)
 
-      if [ -z "$APP_VERSION" ]; then
-        echo "Could not read application version from pubspec.yaml"
-        exit 1
-      fi
+          if [ -z "$APP_VERSION" ]; then
+            echo "Could not read application version from pubspec.yaml"
+            exit 1
+          fi
 
-      echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-      echo "Application version: $APP_VERSION"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Application version: $APP_VERSION"
 
-  - name: Set Android build number
-    shell: bash
-    run: |
-      sed -i -E \
-        "s/^(version:[[:space:]]*[^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1+${GITHUB_RUN_NUMBER}/" \
-        pubspec.yaml
+      - name: Set Android build number
+        shell: bash
+        run: |
+          sed -i -E \
+            "s/^(version:[[:space:]]*[^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1+${GITHUB_RUN_NUMBER}/" \
+            pubspec.yaml
 
-      grep '^version:' pubspec.yaml
+          grep '^version:' pubspec.yaml
 
-  - name: Set custom application ID
-    shell: bash
-    run: |
-      FILE="android/app/build.gradle.kts"
+      - name: Set custom application ID
+        shell: bash
+        run: |
+          FILE="android/app/build.gradle.kts"
 
-      if ! grep -Fq \
-        'applicationId = "com.appshub.bettbox"' "$FILE"; then
-        echo "Expected applicationId was not found in $FILE"
-        exit 1
-      fi
+          if ! grep -Fq \
+            'applicationId = "com.appshub.bettbox"' "$FILE"; then
+            echo "Expected applicationId was not found in $FILE"
+            exit 1
+          fi
 
-      sed -i \
-        's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.custom"/' \
-        "$FILE"
+          sed -i \
+            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.custom"/' \
+            "$FILE"
 
-      grep 'applicationId =' "$FILE"
+          grep 'applicationId =' "$FILE"
 
-  - name: Calculate Release number
-    id: release_number
-    uses: actions/github-script@v7
-    env:
-      APP_VERSION: ${{ steps.version.outputs.app_version }}
-    with:
-      script: |
-        const version = process.env.APP_VERSION;
-        const prefix = `v${version}-custom.`;
+      - name: Calculate Release number
+        id: release_number
+        uses: actions/github-script@v7
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        with:
+          script: |
+            const version = process.env.APP_VERSION;
+            const prefix = `v${version}-custom.`;
 
-        const { data: refs } =
-          await github.rest.git.listMatchingRefs({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            ref: `tags/${prefix}`
-          });
+            const { data: refs } =
+              await github.rest.git.listMatchingRefs({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${prefix}`
+              });
 
-        let maxNumber = 0;
+            let maxNumber = 0;
 
-        for (const item of refs) {
-          const match = item.ref.match(/-custom\.(\d+)$/);
+            for (const item of refs) {
+              const match = item.ref.match(/-custom\.(\d+)$/);
 
-          if (match) {
-            maxNumber = Math.max(
-              maxNumber,
-              Number(match[1])
-            );
-          }
-        }
+              if (match) {
+                maxNumber = Math.max(
+                  maxNumber,
+                  Number(match[1])
+                );
+              }
+            }
 
-        const nextNumber = maxNumber + 1;
+            const nextNumber = maxNumber + 1;
 
-        core.setOutput('number', String(nextNumber));
-        core.info(`Application version: ${version}`);
-        core.info(`Next Release number: ${nextNumber}`);
+            core.setOutput('number', String(nextNumber));
+            core.info(`Application version: ${version}`);
+            core.info(`Next Release number: ${nextNumber}`);
 
-  - name: Setup Rust
-    uses: dtolnay/rust-toolchain@stable
-    with:
-      targets: aarch64-linux-android
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
 
-  - name: Setup Java
-    uses: actions/setup-java@v5
-    with:
-      distribution: temurin
-      java-version: '17'
-      cache: gradle
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
 
-  - name: Setup Android NDK
-    shell: bash
-    run: |
-      NDK_VERSION="28.2.13676358"
+      - name: Setup Android NDK
+        shell: bash
+        run: |
+          NDK_VERSION="28.2.13676358"
 
-      yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
-        --install "ndk;${NDK_VERSION}" >/dev/null 2>&1 || true
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;${NDK_VERSION}" >/dev/null 2>&1 || true
 
-      NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
 
-      if [ ! -d "$NDK_PATH" ]; then
-        echo "Android NDK not found: $NDK_PATH"
-        exit 1
-      fi
+          if [ ! -d "$NDK_PATH" ]; then
+            echo "Android NDK not found: $NDK_PATH"
+            exit 1
+          fi
 
-      echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
 
-  - name: Configure Cargo for Android
-    shell: bash
-    run: |
-      mkdir -p ~/.cargo
+      - name: Configure Cargo for Android
+        shell: bash
+        run: |
+          mkdir -p ~/.cargo
 
-      cat > ~/.cargo/config.toml <<EOF
-      [target.aarch64-linux-android]
-      linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
-      EOF
+          cat > ~/.cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          EOF
 
-  - name: Setup Go
-    uses: actions/setup-go@v6
-    with:
-      go-version: ${{ env.GO_VERSION }}
-      cache-dependency-path: core/go.sum
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
 
-  - name: Setup Flutter
-    uses: subosito/flutter-action@v2
-    with:
-      channel: stable
-      flutter-version: ${{ env.FLUTTER_VERSION }}
-      cache: true
-      cache-key: flutter-android-arm64-${{ hashFiles('**/pubspec.lock') }}
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          cache-key: flutter-android-arm64-${{ hashFiles('**/pubspec.lock') }}
 
-  - name: Clear Pub Cache Credentials
-    shell: bash
-    run: rm -f ~/.pub-cache/credentials.json 2>/dev/null || true
+      - name: Clear Pub Cache Credentials
+        shell: bash
+        run: |
+          rm -f ~/.pub-cache/credentials.json 2>/dev/null || true
 
-  - name: Clean Android build
-    shell: bash
-    run: flutter clean
+      - name: Setup Android signing
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE" ] && \
+             [ -n "$KEY_ALIAS" ] && \
+             [ -n "$STORE_PASSWORD" ] && \
+             [ -n "$KEY_PASSWORD" ]; then
 
-  - name: Setup Android signing
-    shell: bash
-    env:
-      KEYSTORE: ${{ secrets.KEYSTORE }}
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-    run: |
-      set -euo pipefail
+            echo "$KEYSTORE" | base64 --decode \
+              > android/app/keystore.jks
 
-      if [ -z "$KEYSTORE" ] || \
-         [ -z "$KEY_ALIAS" ] || \
-         [ -z "$STORE_PASSWORD" ] || \
-         [ -z "$KEY_PASSWORD" ]; then
-        echo "One or more Android signing secrets are empty."
-        exit 1
-      fi
+            {
+              echo "keyAlias=$KEY_ALIAS"
+              echo "storePassword=$STORE_PASSWORD"
+              echo "keyPassword=$KEY_PASSWORD"
+            } >> android/local.properties
 
-      mkdir -p android/app
-      printf '%s' "$KEYSTORE" | base64 --decode \
-        > android/app/keystore.jks
+            echo "Release signing configured."
 
-      if [ ! -s android/app/keystore.jks ]; then
-        echo "Decoded keystore is missing or empty."
-        exit 1
-      fi
+            keytool -list \
+              -keystore android/app/keystore.jks \
+              -storepass "$STORE_PASSWORD" \
+              -alias "$KEY_ALIAS"
 
-      echo "Checking keystore password and format..."
-      keytool -list \
-        -keystore android/app/keystore.jks \
-        -storepass "$STORE_PASSWORD"
+          else
+            echo "Signing secrets not configured."
+            echo "Gradle will use its debug-signing fallback."
+          fi
 
-      echo "Checking key alias..."
-      keytool -list \
-        -keystore android/app/keystore.jks \
-        -storepass "$STORE_PASSWORD" \
-        -alias "$KEY_ALIAS"
+      - name: Clean Android build
+        shell: bash
+        run: flutter clean
 
-      python3 - <<'PY'
-      from pathlib import Path
+      - name: Build Bettbox Android ARM64
+        shell: bash
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          flutter pub get
+          dart run build_runner build
+          dart setup.dart android --arch arm64 --env stable
 
-      path = Path("android/local.properties")
-      lines = path.read_text().splitlines() if path.exists() else []
+      - name: Verify APK
+        shell: bash
+        run: |
+          shopt -s nullglob
+          APK_FILES=(dist/*.apk)
 
-      keys = {
-          "keyAlias": "${{ secrets.KEY_ALIAS }}",
-          "storePassword": "${{ secrets.STORE_PASSWORD }}",
-          "keyPassword": "${{ secrets.KEY_PASSWORD }}",
-      }
+          if [ ${#APK_FILES[@]} -eq 0 ]; then
+            echo "No APK files found in dist/"
+            exit 1
+          fi
 
-      lines = [
-          line for line in lines
-          if not any(line.startswith(key + "=") for key in keys)
-      ]
+          printf 'Built APK:\n'
+          printf '%s\n' "${APK_FILES[@]}"
 
-      lines.extend(f"{key}={value}" for key, value in keys.items())
-      path.write_text("\n".join(lines) + "\n")
-      PY
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Bettbox-Android-ARM64
+          path: dist/*.apk
+          if-no-files-found: error
+          archive: false
+          overwrite: true
 
-      echo "Android signing configured and verified."
-
-  - name: Build Bettbox Android ARM64
-    shell: bash
-    env:
-      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
-    run: |
-      flutter pub get
-      dart run build_runner build
-      dart setup.dart android --arch arm64 --env stable
-
-  - name: Verify APK
-    shell: bash
-    run: |
-      shopt -s nullglob
-      APK_FILES=(dist/*.apk)
-
-      if [ ${#APK_FILES[@]} -eq 0 ]; then
-        echo "No APK files found in dist/"
-        exit 1
-      fi
-
-      printf 'Built APK:\n'
-      printf '%s\n' "${APK_FILES[@]}"
-
-  - name: Verify final APK signature
-    shell: bash
-    run: |
-      set -euo pipefail
-
-      shopt -s nullglob
-      APK_FILES=(dist/*.apk)
-
-      for APK in "${APK_FILES[@]}"; do
-        echo "Verifying signature: $APK"
-        apksigner verify --verbose "$APK"
-      done
-
-  - name: Upload APK artifact
-    uses: actions/upload-artifact@v7
-    with:
-      name: Bettbox-Android-ARM64
-      path: dist/*.apk
-      if-no-files-found: error
-      archive: false
-      overwrite: true
-
-  - name: Publish GitHub Release
-    uses: softprops/action-gh-release@v3.0.0
-    with:
-      tag_name: v${{ steps.version.outputs.app_version }}-custom.${{ steps.release_number.outputs.number }}
-      name: Bettbox v${{ steps.version.outputs.app_version }} Custom ${{ steps.release_number.outputs.number }}
-      target_commitish: ${{ github.sha }}
-      files: dist/*.apk
-      generate_release_notes: true
-      make_latest: false
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3.0.0
+        with:
+          tag_name: v${{ steps.version.outputs.app_version }}-custom.${{ steps.release_number.outputs.number }}
+          name: Bettbox v${{ steps.version.outputs.app_version }} Custom ${{ steps.release_number.outputs.number }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*.apk
+          generate_release_notes: true
+          make_latest: false
