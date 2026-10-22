@@ -1,295 +1,350 @@
-name: apk
+name: build
 
 on:
-workflow_dispatch:
-inputs:
-release_type:
-description: "选择发布类型"
-required: true
-type: choice
-options:
-- pre
-- stable
-default: pre
+  workflow_dispatch:
 
 permissions:
-contents: write
+  contents: write
 
 concurrency:
-group: bettbox-build
-cancel-in-progress: false
+  group: bettbox-build-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
+  IS_STABLE: ${{ !contains(github.ref, '-') }}
+  IS_PRERELEASE: ${{ contains(github.ref_name, 'pre') }}
+  SHOULD_RELEASE: ${{ !contains(github.ref, '-') || contains(github.ref_name, 'pre') }}
+  GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
 
 jobs:
-build:
-name: Build Bettbox Android ARM64
-runs-on: ubuntu-latest
+  build:
+    name: Build Android ARM64 APK
+    runs-on: ubuntu-latest
 
-steps:
-  - name: Checkout
-    uses: actions/checkout@v4
-    with:
-      fetch-depth: 0
-      fetch-tags: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-  - name: Setup Java
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: "17"
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-  - name: Setup Flutter
-    uses: subosito/flutter-action@v2
-    with:
-      channel: stable
-      flutter-version: "3.47.7"
-      cache: true
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.7'
+          cache: true
 
-  - name: Setup Go
-    uses: actions/setup-go@v5
-    with:
-      go-version: "1.25.x"
-      cache: true
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
 
-  - name: Setup Android SDK
-    uses: android-actions/setup-android@v3
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-  - name: Setup Android NDK
-    uses: nttld/setup-ndk@v1
-    with:
-      ndk-version: "28.2.13676358"
-      add-to-path: true
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: 28.2.13676358
+          add-to-path: true
 
-  - name: Setup Rust
-    uses: dtolnay/rust-toolchain@stable
-    with:
-      targets: aarch64-linux-android
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
 
-  - name: Flutter clean
-    run: flutter clean
+      - name: Flutter clean
+        run: flutter clean
 
-  - name: Flutter dependencies
-    run: flutter pub get
+      - name: Flutter dependencies
+        run: flutter pub get
 
-  - name: Generate code
-    run: dart run build_runner build --delete-conflicting-outputs
+      - name: Generate code
+        run: dart run build_runner build --delete-conflicting-outputs
 
-  - name: Setup Bettbox Android
-    run: dart setup.dart android --arch arm64 --env stable
+      - name: Setup Bettbox Android
+        run: dart setup.dart android --arch arm64 --env stable
 
-  - name: Configure application ID
-    shell: bash
-    run: |
-      set -euo pipefail
+      - name: Read app version
+        id: app_version
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      sed -i -E \
-        's/applicationId = "com\.appshub\.bettbox[^"]*"/applicationId = "com.appshub.bettbox.sky"/' \
-        android/app/build.gradle.kts
+          VERSION=$(grep -m1 '^version:' pubspec.yaml |
+            sed -E 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/')
 
-      grep -q \
-        'applicationId = "com.appshub.bettbox.sky"' \
-        android/app/build.gradle.kts
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not read version from pubspec.yaml."
+            exit 1
+          fi
 
-      echo "Application ID configured."
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Expected a version in X.Y.Z format, got: $VERSION"
+            exit 1
+          fi
 
-  - name: Setup Android signing
-    shell: bash
-    env:
-      KEYSTORE: ${{ secrets.KEYSTORE }}
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-    run: |
-      set -euo pipefail
+          git fetch --tags --force
 
-      if [ -z "$KEYSTORE" ] || \
-         [ -z "$KEY_ALIAS" ] || \
-         [ -z "$STORE_PASSWORD" ] || \
-         [ -z "$KEY_PASSWORD" ]; then
-        echo "ERROR: Android signing secrets are missing."
-        exit 1
-      fi
+          EXISTING=$(git tag -l "v${VERSION}-pre*" |
+            sed -nE "s/^v${VERSION}-pre([0-9]+)$/\1/p" |
+            sort -n |
+            tail -n 1)
 
-      mkdir -p android/app
-      printf '%s' "$KEYSTORE" | base64 --decode \
-        > android/app/keystore.jks
+          if [ -z "$EXISTING" ]; then
+            PRE_NUMBER=1
+          else
+            PRE_NUMBER=$((EXISTING + 1))
+          fi
 
-      test -s android/app/keystore.jks
-      touch android/local.properties
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
 
-      {
-        echo "storePassword=$STORE_PASSWORD"
-        echo "keyPassword=$KEY_PASSWORD"
-        echo "keyAlias=$KEY_ALIAS"
-      } >> android/local.properties
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pre_number=$PRE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}-pre${PRE_NUMBER}" >> "$GITHUB_OUTPUT"
 
-      echo "Android signing configuration created."
+          echo "Version: $VERSION"
+          echo "Pre-release number: $PRE_NUMBER"
+          echo "Tag: v${VERSION}-pre${PRE_NUMBER}"
+          echo "Build number: $BUILD_NUMBER"
 
-  - name: Verify Android keystore
-    shell: bash
-    env:
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-    run: |
-      set -euo pipefail
+      - name: Configure Starry package ID
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      keytool -list \
-        -keystore android/app/keystore.jks \
-        -storepass "$STORE_PASSWORD" \
-        -alias "$KEY_ALIAS" >/dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-      echo "Keystore and alias verified."
+          path = Path("android/app/build.gradle.kts")
+          content = path.read_text()
 
-  - name: Read version and prepare release
-    id: release_info
-    shell: bash
-    env:
-      RELEASE_TYPE: ${{ inputs.release_type }}
-    run: |
-      set -euo pipefail
+          pattern = (
+              r'(?m)^(\s*applicationId\s*=\s*)'
+              r'"com\.appshub\.bettbox(?:\.custom|\.starry)?"\s*$'
+          )
 
-      VERSION=$(sed -nE \
-        's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' \
-        pubspec.yaml | head -n 1)
+          updated, count = re.subn(
+              pattern,
+              r'\1"com.appshub.bettbox.starry"',
+              content,
+          )
 
-      if [ -z "$VERSION" ]; then
-        echo "ERROR: Cannot read version from pubspec.yaml."
-        exit 1
-      fi
+          if count != 1:
+              raise SystemExit(
+                  "ERROR: Expected exactly one applicationId matching "
+                  "the Bettbox package. Found: " + str(count)
+              )
 
-      if [ "$RELEASE_TYPE" = "pre" ]; then
-        EXISTING=$(git ls-remote --tags origin \
-          "refs/tags/v${VERSION}-pre*" |
-          sed -nE "s#.*refs/tags/v${VERSION}-pre([0-9]+)$#\1#p" |
-          sort -n | tail -n 1)
+          path.write_text(updated)
+          print("Application ID: com.appshub.bettbox.starry")
+          PY
 
-        if [ -z "$EXISTING" ]; then
-          PRE_NUMBER=1
-        else
-          PRE_NUMBER=$((EXISTING + 1))
-        fi
+      - name: Configure version
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.app_version.outputs.version }}
+          BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
+        run: |
+          set -euo pipefail
 
-        TAG="v${VERSION}-pre${PRE_NUMBER}"
-        RELEASE_NAME="Bettbox ${VERSION} pre${PRE_NUMBER}"
-        PRERELEASE=true
-      elif [ "$RELEASE_TYPE" = "stable" ]; then
-        TAG="v${VERSION}"
-        RELEASE_NAME="Bettbox ${VERSION}"
-        PRERELEASE=false
-      else
-        echo "ERROR: Unknown release type."
-        exit 1
-      fi
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
 
-      BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          path = Path("pubspec.yaml")
+          content = path.read_text()
 
-      echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
-      echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-      echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
-      echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          version = os.environ["APP_VERSION"]
+          build_number = os.environ["BUILD_NUMBER"]
 
-      echo "Version: $VERSION"
-      echo "Build number: $BUILD_NUMBER"
-      echo "Tag: $TAG"
-      echo "Release: $RELEASE_NAME"
-      echo "Pre-release: $PRERELEASE"
+          updated, count = re.subn(
+              r"(?m)^version:\s*.*$",
+              f"version: {version}+{build_number}",
+              content,
+              count=1,
+          )
 
-  - name: Configure build number
-    shell: bash
-    env:
-      APP_VERSION: ${{ steps.release_info.outputs.version }}
-      BUILD_NUMBER: ${{ steps.release_info.outputs.build_number }}
-    run: |
-      set -euo pipefail
+          if count != 1:
+              raise SystemExit("ERROR: Could not update pubspec.yaml version.")
 
-      sed -i -E \
-        "s/^version:.*/version: ${APP_VERSION}+${BUILD_NUMBER}/" \
-        pubspec.yaml
+          path.write_text(updated)
+          print(f"Configured version: {version}+{build_number}")
+          PY
 
-  - name: Verify release signing configuration
-    shell: bash
-    run: |
-      set -euo pipefail
+      - name: Setup Android signing
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
 
-      grep -q 'create("release")' \
-        android/app/build.gradle.kts
+          if [ -z "$KEYSTORE" ] || \
+             [ -z "$KEY_ALIAS" ] || \
+             [ -z "$STORE_PASSWORD" ] || \
+             [ -z "$KEY_PASSWORD" ]; then
+            echo "ERROR: One or more Android signing secrets are missing."
+            exit 1
+          fi
 
-      grep -q \
-        'signingConfig = signingConfigs.getByName(if (isRelease) "release" else "debug")' \
-        android/app/build.gradle.kts
+          mkdir -p android/app
+          touch android/local.properties
 
-      echo "Gradle signing configuration checked."
+          printf '%s' "$KEYSTORE" | base64 --decode \
+            > android/app/keystore.jks
 
-  - name: Build release APK
-    shell: bash
-    env:
-      APP_VERSION: ${{ steps.release_info.outputs.version }}
-      BUILD_NUMBER: ${{ steps.release_info.outputs.build_number }}
-    run: |
-      set -euo pipefail
+          test -s android/app/keystore.jks
 
-      flutter build apk \
-        --release \
-        --target-platform android-arm64 \
-        --build-name "$APP_VERSION" \
-        --build-number "$BUILD_NUMBER"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
 
-      mkdir -p dist
+          path = Path("android/local.properties")
+          lines = path.read_text().splitlines() if path.exists() else []
 
-      cp build/app/outputs/flutter-apk/app-release.apk \
-        "dist/Bettbox-${APP_VERSION}-${{ inputs.release_type }}-arm64-v8a.apk"
+          values = {
+              "storePassword": os.environ["STORE_PASSWORD"],
+              "keyPassword": os.environ["KEY_PASSWORD"],
+              "keyAlias": os.environ["KEY_ALIAS"],
+          }
 
-  - name: Verify APK signature
-    shell: bash
-    run: |
-      set -euo pipefail
+          # Remove existing signing keys so reruns do not create duplicates.
+          lines = [
+              line for line in lines
+              if not any(
+                  line.startswith(key + "=")
+                  for key in values
+              )
+          ]
 
-      APK=$(find dist -maxdepth 1 -type f -name '*.apk' -print -quit)
+          lines.extend(
+              f"{key}={value}"
+              for key, value in values.items()
+          )
 
-      if [ -z "$APK" ]; then
-        echo "ERROR: APK was not generated."
-        exit 1
-      fi
+          path.write_text("\n".join(lines) + "\n")
+          PY
 
-      APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
-        -type f -name apksigner -print -quit)
+          echo "Android signing configuration written."
 
-      if [ -z "$APKSIGNER" ]; then
-        echo "ERROR: apksigner was not found."
-        exit 1
-      fi
+      - name: Verify Android signing
+        shell: bash
+        env:
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
 
-      "$APKSIGNER" verify --verbose "$APK"
+          test -s android/app/keystore.jks
 
-      echo "APK signature verification passed."
+          keytool -list \
+            -keystore android/app/keystore.jks \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
 
-  - name: Upload APK artifact
-    uses: actions/upload-artifact@v4
-    with:
-      name: Bettbox-Android-arm64-${{ inputs.release_type }}
-      path: dist/*.apk
-      if-no-files-found: error
-      retention-days: 14
+          echo "Keystore and alias verified."
 
-  - name: Publish GitHub Release
-    uses: softprops/action-gh-release@v2
-    with:
-      tag_name: ${{ steps.release_info.outputs.tag }}
-      name: ${{ steps.release_info.outputs.release_name }}
-      prerelease: ${{ steps.release_info.outputs.prerelease }}
-      make_latest: ${{ inputs.release_type == 'stable' && 'true' || 'false' }}
-      fail_on_unmatched_files: true
-      files: dist/*.apk
-      body: |
-        Bettbox Android build.
+      - name: Verify package and signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        - Application ID: com.appshub.bettbox.sky
-        - Version: ${{ steps.release_info.outputs.version }}
-        - Build number: ${{ steps.release_info.outputs.build_number }}
-        - Architecture: arm64-v8a
-        - Release type: ${{ inputs.release_type }}
+          grep -q \
+            'applicationId = "com.appshub.bettbox.starry"' \
+            android/app/build.gradle.kts
 
-        The APK is signed with the configured Android signing key.
+          grep -q 'create("release")' \
+            android/app/build.gradle.kts
+
+          grep -q \
+            'signingConfig = signingConfigs.getByName(if (isRelease) "release" else "debug")' \
+            android/app/build.gradle.kts
+
+          echo "Package ID and Gradle signing configuration checked."
+
+      - name: Build release APK
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.app_version.outputs.version }}
+          BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
+          PRE_NUMBER: ${{ steps.app_version.outputs.pre_number }}
+        run: |
+          set -euo pipefail
+
+          flutter build apk \
+            --release \
+            --target-platform android-arm64 \
+            --build-number "$BUILD_NUMBER" \
+            --build-name "$APP_VERSION"
+
+          mkdir -p dist
+
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "dist/Bettbox-${APP_VERSION}-pre${PRE_NUMBER}-arm64-v8a.apk"
+
+      - name: Verify APK output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK=$(find dist -maxdepth 1 -type f -name '*.apk' -print -quit)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: No APK was generated."
+            exit 1
+          fi
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+            -type f -name apksigner -print -quit)
+
+          if [ -z "$APKSIGNER" ]; then
+            echo "ERROR: apksigner not found."
+            exit 1
+          fi
+
+          "$APKSIGNER" verify --verbose "$APK"
+
+          echo "APK generated and signature verified: $APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bettbox-Android-arm64
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ env.SHOULD_RELEASE == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.app_version.outputs.tag }}
+          name: Bettbox ${{ steps.app_version.outputs.version }} pre${{ steps.app_version.outputs.pre_number }}
+          body: |
+            Bettbox Android ARM64 pre-release build.
+
+            - Architecture: arm64-v8a
+            - Application ID: com.appshub.bettbox.starry
+            - Version: ${{ steps.app_version.outputs.version }}
+            - Pre-release number: ${{ steps.app_version.outputs.pre_number }}
+            - Build number: ${{ steps.app_version.outputs.build_number }}
+
+            Signed using the repository's configured Android signing key.
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: dist/*.apk
+          make_latest: false
