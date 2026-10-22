@@ -7,181 +7,176 @@ permissions:
   contents: write
 
 concurrency:
-  group: bettbox-build-${{ github.ref }}
-  cancel-in-progress: true
+  group: bettbox-custom-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  IS_STABLE: ${{ !contains(github.ref, '-') }}
-  IS_PRERELEASE: ${{ contains(github.ref_name, 'pre') }}
-  SHOULD_RELEASE: ${{ !contains(github.ref, '-') || contains(github.ref_name, 'pre') }}
+  FLUTTER_VERSION: '3.47.7'
+  GO_VERSION: '1.25.x'
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SENTRY_BACKEND: none
+  IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
 
 jobs:
   build:
-    name: Build Android ARM64 APK
-    runs-on: ubuntu-latest
+    name: Build Bettbox Android ARM64
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          fetch-tags: true
+          submodules: recursive
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          APP_VERSION=$(sed -nE \
+            's/^version:[[:space:]]*([^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1/p' \
+            pubspec.yaml | head -n 1)
+
+          if [ -z "$APP_VERSION" ]; then
+            echo "Could not read application version from pubspec.yaml"
+            exit 1
+          fi
+
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Application version: $APP_VERSION"
+
+      - name: Set Android build number
+        shell: bash
+        run: |
+          sed -i -E \
+            "s/^(version:[[:space:]]*[^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1+${GITHUB_RUN_NUMBER}/" \
+            pubspec.yaml
+
+          grep '^version:' pubspec.yaml
+
+      - name: Set custom application ID
+        shell: bash
+        run: |
+          FILE="android/app/build.gradle.kts"
+
+          if ! grep -Fq \
+            'applicationId = "com.appshub.bettbox"' "$FILE"; then
+            echo "Expected applicationId was not found in $FILE"
+            exit 1
+          fi
+
+          sed -i \
+            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.custom"/' \
+            "$FILE"
+
+          grep 'applicationId =' "$FILE"
+
+      - name: Calculate Release number
+        id: release_number
+        uses: actions/github-script@v7
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
         with:
-          distribution: temurin
-          java-version: '17'
+          script: |
+            const version = process.env.APP_VERSION;
+            const prefix = `v${version}-custom.`;
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          flutter-version: '3.47.7'
-          cache: true
+            const { data: refs } =
+              await github.rest.git.listMatchingRefs({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${prefix}`
+              });
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.x'
-          cache: true
+            let maxNumber = 0;
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+            for (const item of refs) {
+              const match = item.ref.match(/-custom\.(\d+)$/);
 
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: 28.2.13676358
-          add-to-path: true
+              if (match) {
+                maxNumber = Math.max(
+                  maxNumber,
+                  Number(match[1])
+                );
+              }
+            }
+
+            const nextNumber = maxNumber + 1;
+
+            core.setOutput('number', String(nextNumber));
+            core.info(`Application version: ${version}`);
+            core.info(`Next Release number: ${nextNumber}`);
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
-      - name: Flutter clean
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Android NDK
+        shell: bash
+        run: |
+          NDK_VERSION="28.2.13676358"
+
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;${NDK_VERSION}" >/dev/null 2>&1 || true
+
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+
+          if [ ! -d "$NDK_PATH" ]; then
+            echo "Android NDK not found: $NDK_PATH"
+            exit 1
+          fi
+
+          echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+
+      - name: Configure Cargo for Android
+        shell: bash
+        run: |
+          mkdir -p ~/.cargo
+
+          cat > ~/.cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          EOF
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          cache-key: flutter-android-arm64-${{ hashFiles('**/pubspec.lock') }}
+
+      - name: Clear Pub Cache Credentials
+        shell: bash
+        run: rm -f ~/.pub-cache/credentials.json 2>/dev/null || true
+
+      - name: Clean Android build
+        shell: bash
         run: flutter clean
 
-      - name: Flutter dependencies
-        run: flutter pub get
-
-      - name: Generate code
-        run: dart run build_runner build --delete-conflicting-outputs
-
-      - name: Setup Bettbox Android
-        run: dart setup.dart android --arch arm64 --env stable
-
-      - name: Read app version
-        id: app_version
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          VERSION=$(grep -m1 '^version:' pubspec.yaml |
-            sed -E 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/')
-
-          if [ -z "$VERSION" ]; then
-            echo "ERROR: Could not read version from pubspec.yaml."
-            exit 1
-          fi
-
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "ERROR: Expected a version in X.Y.Z format, got: $VERSION"
-            exit 1
-          fi
-
-          git fetch --tags --force
-
-          EXISTING=$(git tag -l "v${VERSION}-pre*" |
-            sed -nE "s/^v${VERSION}-pre([0-9]+)$/\1/p" |
-            sort -n |
-            tail -n 1)
-
-          if [ -z "$EXISTING" ]; then
-            PRE_NUMBER=1
-          else
-            PRE_NUMBER=$((EXISTING + 1))
-          fi
-
-          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "pre_number=$PRE_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "tag=v${VERSION}-pre${PRE_NUMBER}" >> "$GITHUB_OUTPUT"
-
-          echo "Version: $VERSION"
-          echo "Pre-release number: $PRE_NUMBER"
-          echo "Tag: v${VERSION}-pre${PRE_NUMBER}"
-          echo "Build number: $BUILD_NUMBER"
-
-      - name: Configure Starry package ID
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path("android/app/build.gradle.kts")
-          content = path.read_text()
-
-          pattern = (
-              r'(?m)^(\s*applicationId\s*=\s*)'
-              r'"com\.appshub\.bettbox(?:\.custom|\.starry)?"\s*$'
-          )
-
-          updated, count = re.subn(
-              pattern,
-              r'\1"com.appshub.bettbox.starry"',
-              content,
-          )
-
-          if count != 1:
-              raise SystemExit(
-                  "ERROR: Expected exactly one applicationId matching "
-                  "the Bettbox package. Found: " + str(count)
-              )
-
-          path.write_text(updated)
-          print("Application ID: com.appshub.bettbox.starry")
-          PY
-
-      - name: Configure version
+      - name: Build Bettbox Android ARM64
         shell: bash
         env:
-          APP_VERSION: ${{ steps.app_version.outputs.version }}
-          BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          path = Path("pubspec.yaml")
-          content = path.read_text()
-
-          version = os.environ["APP_VERSION"]
-          build_number = os.environ["BUILD_NUMBER"]
-
-          updated, count = re.subn(
-              r"(?m)^version:\s*.*$",
-              f"version: {version}+{build_number}",
-              content,
-              count=1,
-          )
-
-          if count != 1:
-              raise SystemExit("ERROR: Could not update pubspec.yaml version.")
-
-          path.write_text(updated)
-          print(f"Configured version: {version}+{build_number}")
-          PY
+          flutter pub get
+          dart run build_runner build
+          dart setup.dart android --arch arm64 --env stable
 
       - name: Setup Android signing
         shell: bash
@@ -217,12 +212,12 @@ jobs:
           lines = path.read_text().splitlines() if path.exists() else []
 
           values = {
+              "keyAlias": os.environ["KEY_ALIAS"],
               "storePassword": os.environ["STORE_PASSWORD"],
               "keyPassword": os.environ["KEY_PASSWORD"],
-              "keyAlias": os.environ["KEY_ALIAS"],
           }
 
-          # Remove existing signing keys so reruns do not create duplicates.
+          # Preserve unrelated properties and replace existing signing keys.
           lines = [
               line for line in lines
               if not any(
@@ -258,14 +253,10 @@ jobs:
 
           echo "Keystore and alias verified."
 
-      - name: Verify package and signing configuration
+      - name: Verify Gradle signing configuration
         shell: bash
         run: |
           set -euo pipefail
-
-          grep -q \
-            'applicationId = "com.appshub.bettbox.starry"' \
-            android/app/build.gradle.kts
 
           grep -q 'create("release")' \
             android/app/build.gradle.kts
@@ -274,77 +265,58 @@ jobs:
             'signingConfig = signingConfigs.getByName(if (isRelease) "release" else "debug")' \
             android/app/build.gradle.kts
 
-          echo "Package ID and Gradle signing configuration checked."
+          echo "Gradle release signing configuration checked."
 
       - name: Build release APK
         shell: bash
-        env:
-          APP_VERSION: ${{ steps.app_version.outputs.version }}
-          BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
-          PRE_NUMBER: ${{ steps.app_version.outputs.pre_number }}
         run: |
           set -euo pipefail
 
           flutter build apk \
             --release \
-            --target-platform android-arm64 \
-            --build-number "$BUILD_NUMBER" \
-            --build-name "$APP_VERSION"
+            --target-platform android-arm64
 
-          mkdir -p dist
-
-          cp build/app/outputs/flutter-apk/app-release.apk \
-            "dist/Bettbox-${APP_VERSION}-pre${PRE_NUMBER}-arm64-v8a.apk"
-
-      - name: Verify APK output
+      - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
 
-          APK=$(find dist -maxdepth 1 -type f -name '*.apk' -print -quit)
+          shopt -s nullglob
+          APK_FILES=(dist/*.apk)
 
-          if [ -z "$APK" ]; then
-            echo "ERROR: No APK was generated."
+          if [ ${#APK_FILES[@]} -eq 0 ]; then
+            echo "No APK files found in dist/"
             exit 1
           fi
 
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" \
             -type f -name apksigner -print -quit)
 
           if [ -z "$APKSIGNER" ]; then
-            echo "ERROR: apksigner not found."
+            echo "apksigner not found."
             exit 1
           fi
 
-          "$APKSIGNER" verify --verbose "$APK"
-
-          echo "APK generated and signature verified: $APK"
+          for APK in "${APK_FILES[@]}"; do
+            "$APKSIGNER" verify --verbose "$APK"
+            echo "Verified APK: $APK"
+          done
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: Bettbox-Android-arm64
+          name: Bettbox-Android-ARM64
           path: dist/*.apk
           if-no-files-found: error
-          retention-days: 14
+          archive: false
+          overwrite: true
 
       - name: Publish GitHub Release
-        if: ${{ env.SHOULD_RELEASE == 'true' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.0
         with:
-          tag_name: ${{ steps.app_version.outputs.tag }}
-          name: Bettbox ${{ steps.app_version.outputs.version }} pre${{ steps.app_version.outputs.pre_number }}
-          body: |
-            Bettbox Android ARM64 pre-release build.
-
-            - Architecture: arm64-v8a
-            - Application ID: com.appshub.bettbox.starry
-            - Version: ${{ steps.app_version.outputs.version }}
-            - Pre-release number: ${{ steps.app_version.outputs.pre_number }}
-            - Build number: ${{ steps.app_version.outputs.build_number }}
-
-            Signed using the repository's configured Android signing key.
-          prerelease: true
-          fail_on_unmatched_files: true
+          tag_name: v${{ steps.version.outputs.app_version }}-custom.${{ steps.release_number.outputs.number }}
+          name: Bettbox v${{ steps.version.outputs.app_version }} Custom ${{ steps.release_number.outputs.number }}
+          target_commitish: ${{ github.sha }}
           files: dist/*.apk
+          generate_release_notes: true
           make_latest: false
