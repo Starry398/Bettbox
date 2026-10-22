@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: bettbox-custom-${{ github.ref }}
+  group: bettbox-starry-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -67,7 +67,7 @@ jobs:
           fi
 
           sed -i \
-            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.custom"/' \
+            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.starry"/' \
             "$FILE"
 
           grep 'applicationId =' "$FILE"
@@ -80,7 +80,7 @@ jobs:
         with:
           script: |
             const version = process.env.APP_VERSION;
-            const prefix = `v${version}-custom.`;
+            const prefix = `v${version}-pre.`;
 
             const { data: refs } =
               await github.rest.git.listMatchingRefs({
@@ -92,7 +92,7 @@ jobs:
             let maxNumber = 0;
 
             for (const item of refs) {
-              const match = item.ref.match(/-custom\.(\d+)$/);
+              const match = item.ref.match(/-pre\.(\d+)$/);
 
               if (match) {
                 maxNumber = Math.max(
@@ -174,31 +174,29 @@ jobs:
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE" ] && \
-             [ -n "$KEY_ALIAS" ] && \
-             [ -n "$STORE_PASSWORD" ] && \
-             [ -n "$KEY_PASSWORD" ]; then
-
-            echo "$KEYSTORE" | base64 --decode \
-              > android/app/keystore.jks
-
-            {
-              echo "keyAlias=$KEY_ALIAS"
-              echo "storePassword=$STORE_PASSWORD"
-              echo "keyPassword=$KEY_PASSWORD"
-            } >> android/local.properties
-
-            echo "Release signing configured."
-
-            keytool -list \
-              -keystore android/app/keystore.jks \
-              -storepass "$STORE_PASSWORD" \
-              -alias "$KEY_ALIAS"
-
-          else
-            echo "Signing secrets not configured."
-            echo "Gradle will use its debug-signing fallback."
+          if [ -z "$KEYSTORE" ] || \
+             [ -z "$KEY_ALIAS" ] || \
+             [ -z "$STORE_PASSWORD" ] || \
+             [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Signing secrets are missing. Please configure KEYSTORE, KEY_ALIAS, STORE_PASSWORD and KEY_PASSWORD in repository secrets."
+            exit 1
           fi
+
+          echo "$KEYSTORE" | base64 --decode \
+            > android/app/keystore.jks
+
+          {
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> android/local.properties
+
+          echo "Release signing configured."
+
+          keytool -list \
+            -keystore android/app/keystore.jks \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS"
 
       - name: Clean Android build
         shell: bash
@@ -239,8 +237,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3.0.0
         with:
-          tag_name: v${{ steps.version.outputs.app_version }}-custom.${{ steps.release_number.outputs.number }}
-          name: Bettbox v${{ steps.version.outputs.app_version }} Custom ${{ steps.release_number.outputs.number }}
+          tag_name: v${{ steps.version.outputs.app_version }}-pre.${{ steps.release_number.outputs.number }}
+          name: Bettbox v${{ steps.version.outputs.app_version }} Pre ${{ steps.release_number.outputs.number }}
           target_commitish: ${{ github.sha }}
           files: dist/*.apk
           generate_release_notes: true
