@@ -1,4 +1,3 @@
-
 name: Upstream Release
 
 on:
@@ -17,7 +16,6 @@ env:
   FLUTTER_VERSION: '3.47.7'
   GO_VERSION: '1.25.x'
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SENTRY_BACKEND: none
   IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
 
@@ -41,24 +39,23 @@ jobs:
           RELEASE=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/appshubcc/Bettbox/releases/latest")
+            https://api.github.com/repos/appshubcc/Bettbox/releases/latest)
 
           TAG=$(echo "$RELEASE" | jq -er '.tag_name')
 
           if ! [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Unexpected stable release tag: $TAG"
+            echo "::error::Unexpected upstream stable release tag: $TAG"
             exit 1
           fi
 
-          echo "Latest upstream release: $TAG"
+          echo "Upstream release: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          if gh release view "$TAG" \
-            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists. Skipping build."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists in this repository."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Release $TAG does not exist yet. Build required."
+            echo "Release $TAG does not exist yet."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -70,7 +67,7 @@ jobs:
 
     steps:
       - name: Checkout upstream release source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: appshubcc/Bettbox
           ref: ${{ needs.check-release.outputs.tag }}
@@ -79,10 +76,9 @@ jobs:
           path: upstream
 
       - name: Checkout custom XML files
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
-          ref: ${{ github.event.repository.default_branch }}
           path: custom-files
           sparse-checkout: .github
           sparse-checkout-cone-mode: true
@@ -102,48 +98,60 @@ jobs:
             ic_launcher_foreground_dark.xml \
             ic_launcher_foreground_light.xml
           do
-            if [ ! -f "$SOURCE/$file" ]; then
-              echo "::error::Missing custom XML: $SOURCE/$file"
+            test -f "$SOURCE/$file" || {
+              echo "::error::Missing custom resource: $SOURCE/$file"
               exit 1
-            fi
+            }
 
-            if [ ! -f "$TARGET/$file" ]; then
+            test -f "$TARGET/$file" || {
               echo "::error::Upstream resource not found: $TARGET/$file"
               exit 1
-            fi
+            }
 
             cp "$SOURCE/$file" "$TARGET/$file"
             echo "Restored $file"
           done
 
-      - name: Read application version
-        id: version
+      - name: Set application version and automatic build number
         working-directory: upstream
         shell: bash
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
-          APP_VERSION=$(sed -nE \
-            's/^version:[[:space:]]*([^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1/p' \
+          ORIGINAL_VERSION=$(sed -nE \
+            's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' \
             pubspec.yaml | head -n 1)
 
-          if [ -z "$APP_VERSION" ]; then
-            echo "::error::Could not read version from pubspec.yaml"
+          if [[ -z "$ORIGINAL_VERSION" ]]; then
+            echo "::error::Cannot find version in pubspec.yaml"
             exit 1
           fi
 
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Application version: $APP_VERSION"
+          VERSION_NAME="${ORIGINAL_VERSION%%+*}"
 
-      - name: Set Android build number
-        working-directory: upstream
-        shell: bash
-        run: |
-          set -euo pipefail
+          if ! [[ "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected upstream version: $ORIGINAL_VERSION"
+            exit 1
+          fi
+
+          DATE_BASE=$(date -u +%Y%m%d)
+          VERSION_CODE=$((10#$DATE_BASE * 100 + RUN_NUMBER))
+
+          if (( VERSION_CODE > 2100000000 )); then
+            echo "::error::Android versionCode exceeds the supported limit"
+            exit 1
+          fi
 
           sed -i -E \
-            "s/^(version:[[:space:]]*[^+[:space:]]+)(\+[0-9]+)?[[:space:]]*$/\1+${GITHUB_RUN_NUMBER}/" \
+            "s/^version:.*/version: ${VERSION_NAME}+${VERSION_CODE}/" \
             pubspec.yaml
+
+          echo "Upstream version: $ORIGINAL_VERSION"
+          echo "New Flutter version: ${VERSION_NAME}+${VERSION_CODE}"
+          echo "EXPECTED_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "EXPECTED_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
 
           grep '^version:' pubspec.yaml
 
@@ -155,17 +163,16 @@ jobs:
 
           FILE="android/app/build.gradle.kts"
 
-          if ! grep -Fq \
-            'applicationId = "com.appshub.bettbox"' "$FILE"; then
-            echo "::error::Expected upstream applicationId was not found."
+          grep -Fq 'applicationId = "com.appshub.bettbox"' "$FILE" || {
+            echo "::error::Expected applicationId was not found. Check upstream Gradle configuration."
             exit 1
-          fi
+          }
 
           sed -i \
             's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.starry"/' \
             "$FILE"
 
-          grep 'applicationId =' "$FILE"
+          grep -F 'applicationId =' "$FILE"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -173,7 +180,7 @@ jobs:
           targets: aarch64-linux-android
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
@@ -191,12 +198,13 @@ jobs:
 
           NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
 
-          if [ ! -d "$NDK_PATH" ]; then
-            echo "::error::Android NDK not found: $NDK_PATH"
+          test -d "$NDK_PATH" || {
+            echo "::error::Android NDK $NDK_VERSION was not installed"
             exit 1
-          fi
+          }
 
           echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK_PATH"
 
       - name: Configure Cargo for Android
         shell: bash
@@ -210,8 +218,10 @@ jobs:
           linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
           EOF
 
+          cat ~/.cargo/config.toml
+
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: upstream/core/go.sum
@@ -225,8 +235,7 @@ jobs:
 
       - name: Clear Pub Cache Credentials
         shell: bash
-        run: |
-          rm -f ~/.pub-cache/credentials.json 2>/dev/null || true
+        run: rm -f ~/.pub-cache/credentials.json || true
 
       - name: Setup Android signing
         working-directory: upstream
@@ -239,18 +248,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "$KEYSTORE" ] || \
-             [ -z "$KEY_ALIAS" ] || \
-             [ -z "$STORE_PASSWORD" ] || \
-             [ -z "$KEY_PASSWORD" ]; then
-            echo "::error::Android signing secrets are missing."
-            exit 1
-          fi
+          for name in KEYSTORE KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
 
-          echo "$KEYSTORE" | base64 --decode \
-            > android/app/keystore.jks
+          printf '%s' "$KEYSTORE" | base64 --decode > android/app/keystore.jks
 
           {
+            echo "storeFile=keystore.jks"
             echo "keyAlias=$KEY_ALIAS"
             echo "storePassword=$STORE_PASSWORD"
             echo "keyPassword=$KEY_PASSWORD"
@@ -259,7 +267,7 @@ jobs:
           keytool -list \
             -keystore android/app/keystore.jks \
             -storepass "$STORE_PASSWORD" \
-            -alias "$KEY_ALIAS"
+            -alias "$KEY_ALIAS" >/dev/null
 
       - name: Clean Android build
         working-directory: upstream
@@ -270,7 +278,7 @@ jobs:
         working-directory: upstream
         shell: bash
         env:
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_DSN: ''
         run: |
           set -euo pipefail
 
@@ -278,29 +286,65 @@ jobs:
           dart run build_runner build
           dart setup.dart android --arch arm64 --env stable
 
-      - name: Verify APK
+      - name: Verify APK and version code
         working-directory: upstream
         shell: bash
         run: |
           set -euo pipefail
+
           shopt -s nullglob
           APK_FILES=(dist/*.apk)
 
-          if [ "${#APK_FILES[@]}" -eq 0 ]; then
+          if (( ${#APK_FILES[@]} == 0 )); then
             echo "::error::No APK files found in dist/"
             exit 1
           fi
 
-          printf '%s\n' "${APK_FILES[@]}"
+          APKANALYZER=$(find "${ANDROID_SDK_ROOT}/cmdline-tools" \
+            -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+
+          if [[ -z "$APKANALYZER" ]]; then
+            APKANALYZER=$(find "${ANDROID_SDK_ROOT}/build-tools" \
+              -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+          fi
+
+          if [[ -z "$APKANALYZER" ]]; then
+            echo "::error::apkanalyzer not found; cannot verify APK version"
+            exit 1
+          fi
+
+          VERIFIED=0
+
+          for APK in "${APK_FILES[@]}"; do
+            CODE=$("$APKANALYZER" manifest version-code "$APK")
+            NAME=$("$APKANALYZER" manifest version-name "$APK")
+
+            echo "APK: $APK"
+            echo "versionName: $NAME"
+            echo "versionCode: $CODE"
+
+            if [[ "$CODE" != "$EXPECTED_VERSION_CODE" ]]; then
+              echo "::error::Unexpected versionCode in $APK: $CODE (expected $EXPECTED_VERSION_CODE)"
+              exit 1
+            fi
+
+            if [[ "$NAME" != "$EXPECTED_VERSION_NAME" ]]; then
+              echo "::error::Unexpected versionName in $APK (expected $EXPECTED_VERSION_NAME)"
+              exit 1
+            fi
+
+            VERIFIED=$((VERIFIED + 1))
+          done
+
+          echo "Verified $VERIFIED APK file(s)."
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: Bettbox-Android-ARM64-${{ needs.check-release.outputs.tag }}
           path: upstream/dist/*.apk
           if-no-files-found: error
-          archive: false
-          overwrite: true
+          retention-days: 30
 
       - name: Publish GitHub Release
         env:
@@ -313,5 +357,4 @@ jobs:
           gh release create "$RELEASE_TAG" upstream/dist/*.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$RELEASE_TAG" \
-            --generate-notes \
-            --target "$GITHUB_SHA"
+            --generate-notes
