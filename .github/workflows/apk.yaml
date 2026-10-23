@@ -238,8 +238,9 @@ jobs:
         uses: softprops/action-gh-release@v3.0.0
         with:
           tag_name: v${{ steps.version.outputs.app_version }}-pre.${{ steps.release_number.outputs.number }}
-          name: Bettbox v${{ steps.version.outputs.app_version }} Pre ${{ steps.release_number.outputs.number }}
+          name: v${{ steps.version.outputs.app_version }}-pre.${{ steps.release_number.outputs.number }}
           target_commitish: ${{ github.sha }}
+          prerelease: true
           files: dist/*.apk
           generate_release_notes: true
           make_latest: false
