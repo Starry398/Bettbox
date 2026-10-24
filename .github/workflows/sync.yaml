@@ -1,0 +1,414 @@
+name: Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bettbox-sync
+  cancel-in-progress: false
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
+  SENTRY_BACKEND: none
+  IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
+
+jobs:
+  check-release:
+    name: Check upstream release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+
+    steps:
+      - name: Find latest stable upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/appshubcc/Bettbox/releases/latest)
+
+          TAG=$(echo "$RELEASE" | jq -er '.tag_name')
+
+          if ! [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream stable release tag: $TAG"
+            exit 1
+          fi
+
+          echo "Upstream release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists in this repository."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG does not exist yet."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Bettbox Android ARM64
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout upstream release source
+        uses: actions/checkout@v4
+        with:
+          repository: appshubcc/Bettbox
+          ref: ${{ needs.check-release.outputs.tag }}
+          fetch-depth: 0
+          submodules: recursive
+          path: upstream
+
+      - name: Checkout custom XML files
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: custom-files
+          sparse-checkout: starry/xml
+          sparse-checkout-cone-mode: true
+
+      - name: Restore custom XML resources
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE="../custom-files/starry/xml"
+          TARGET="android/app/src/main/res/drawable"
+
+          for file in \
+            splash_text_dark.xml \
+            splash_text_light.xml \
+            ic_launcher_foreground_dark.xml \
+            ic_launcher_foreground_light.xml
+          do
+            test -f "$SOURCE/$file" || {
+              echo "::error::Missing custom resource: $SOURCE/$file"
+              exit 1
+            }
+
+            test -f "$TARGET/$file" || {
+              echo "::error::Upstream resource not found: $TARGET/$file"
+              exit 1
+            }
+
+            cp "$SOURCE/$file" "$TARGET/$file"
+            echo "Restored $file"
+          done
+
+      - name: Read upstream toolchain versions
+        id: toolchain
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE=".github/workflows/build.yaml"
+
+          test -f "$FILE" || {
+            echo "::error::Upstream build workflow not found: $FILE"
+            exit 1
+          }
+
+          NDK_VERSION=$(sed -nE \
+            's/^[[:space:]]*NDK_VERSION="([^"]+)".*/\1/p' \
+            "$FILE" | head -n 1)
+
+          FLUTTER_VERSION=$(grep -E '^[[:space:]]*flutter-version:' "$FILE" \
+            | grep -oE "'[0-9]+\.[0-9]+\.[0-9]+'" \
+            | tail -n 1 | tr -d "'")
+
+          GO_VERSION=$(grep -E '^[[:space:]]*go-version:' "$FILE" \
+            | grep -oE "'[0-9]+\.[0-9]+\.x'" \
+            | tail -n 1 | tr -d "'")
+
+          if [[ -z "$NDK_VERSION" || -z "$FLUTTER_VERSION" || -z "$GO_VERSION" ]]; then
+            echo "::error::Failed to parse Flutter, Go or NDK version from upstream build.yaml"
+            echo "Please inspect the upstream workflow format."
+            exit 1
+          fi
+
+          echo "Flutter version: $FLUTTER_VERSION"
+          echo "Go version: $GO_VERSION"
+          echo "NDK version: $NDK_VERSION"
+
+          echo "flutter_version=$FLUTTER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "ndk_version=$NDK_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set application version and automatic build number
+        id: app-version
+        working-directory: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_VERSION=$(sed -nE \
+            's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' \
+            pubspec.yaml | head -n 1)
+
+          if [[ -z "$ORIGINAL_VERSION" ]]; then
+            echo "::error::Cannot find version in pubspec.yaml"
+            exit 1
+          fi
+
+          VERSION_NAME="${ORIGINAL_VERSION%%+*}"
+
+          if ! [[ "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected upstream version: $ORIGINAL_VERSION"
+            exit 1
+          fi
+
+          DATE_BASE=$(date -u +%Y%m%d)
+          TODAY=$(date -u +%Y-%m-%d)
+
+          RUNS=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sync.yaml/runs?created=${TODAY}T00:00:00Z..${TODAY}T23:59:59Z&per_page=100")
+
+          DAY_RUN=$(echo "$RUNS" | jq -er '.workflow_runs | length')
+
+          if (( DAY_RUN < 1 )); then
+            echo "::error::Unable to determine today's workflow run count"
+            exit 1
+          fi
+
+          VERSION_CODE=$((10#$DATE_BASE * 100 + DAY_RUN))
+
+          if (( VERSION_CODE > 2100000000 )); then
+            echo "::error::Android versionCode exceeds the supported limit"
+            exit 1
+          fi
+
+          sed -i -E \
+            "s/^version:.*/version: ${VERSION_NAME}+${VERSION_CODE}/" \
+            pubspec.yaml
+
+          echo "Upstream version: $ORIGINAL_VERSION"
+          echo "New Flutter version: ${VERSION_NAME}+${VERSION_CODE}"
+          echo "EXPECTED_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "EXPECTED_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+          grep '^version:' pubspec.yaml
+
+      - name: Set custom application ID
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="android/app/build.gradle.kts"
+
+          grep -Fq 'applicationId = "com.appshub.bettbox"' "$FILE" || {
+            echo "::error::Expected applicationId was not found. Check upstream Gradle configuration."
+            exit 1
+          }
+
+          sed -i \
+            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.starry"/' \
+            "$FILE"
+
+          grep -F 'applicationId =' "$FILE"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Android NDK
+        shell: bash
+        env:
+          NDK_VERSION: ${{ steps.toolchain.outputs.ndk_version }}
+        run: |
+          set -euo pipefail
+
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;${NDK_VERSION}" >/dev/null 2>&1 || true
+
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+
+          test -d "$NDK_PATH" || {
+            echo "::error::Android NDK $NDK_VERSION was not installed"
+            exit 1
+          }
+
+          echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK_PATH"
+
+      - name: Configure Cargo for Android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.cargo
+
+          cat > ~/.cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          EOF
+
+          cat ~/.cargo/config.toml
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache-dependency-path: upstream/core/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.toolchain.outputs.flutter_version }}
+          cache: true
+
+      - name: Clear Pub Cache Credentials
+        shell: bash
+        run: rm -f ~/.pub-cache/credentials.json || true
+
+      - name: Setup Android signing
+        working-directory: upstream
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for name in KEYSTORE KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          printf '%s' "$KEYSTORE" | base64 --decode > android/app/keystore.jks
+
+          {
+            echo "storeFile=keystore.jks"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> android/local.properties
+
+          keytool -list \
+            -keystore android/app/keystore.jks \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+
+      - name: Clean Android build
+        working-directory: upstream
+        shell: bash
+        run: flutter clean
+
+      - name: Build Bettbox Android ARM64
+        working-directory: upstream
+        shell: bash
+        env:
+          SENTRY_DSN: ''
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+          dart run build_runner build
+          dart setup.dart android --arch arm64 --env stable
+
+      - name: Verify APK and version code
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          APK_FILES=(dist/*.apk)
+
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo "::error::No APK files found in dist/"
+            exit 1
+          fi
+
+          APKANALYZER=$(find "${ANDROID_SDK_ROOT}/cmdline-tools" \
+            -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+
+          if [[ -z "$APKANALYZER" ]]; then
+            APKANALYZER=$(find "${ANDROID_SDK_ROOT}/build-tools" \
+              -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+          fi
+
+          if [[ -z "$APKANALYZER" ]]; then
+            echo "::error::apkanalyzer not found; cannot verify APK version"
+            exit 1
+          fi
+
+          VERIFIED=0
+
+          for APK in "${APK_FILES[@]}"; do
+            CODE=$("$APKANALYZER" manifest version-code "$APK")
+            NAME=$("$APKANALYZER" manifest version-name "$APK")
+
+            echo "APK: $APK"
+            echo "versionName: $NAME"
+            echo "versionCode: $CODE"
+
+            if [[ "$CODE" != "$EXPECTED_VERSION_CODE" ]]; then
+              echo "::error::Unexpected versionCode in $APK: $CODE (expected $EXPECTED_VERSION_CODE)"
+              exit 1
+            fi
+
+            if [[ "$NAME" != "$EXPECTED_VERSION_NAME" ]]; then
+              echo "::error::Unexpected versionName in $APK (expected $EXPECTED_VERSION_NAME)"
+              exit 1
+            fi
+
+            VERIFIED=$((VERIFIED + 1))
+          done
+
+          echo "Verified $VERIFIED APK file(s)."
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bettbox-Android-ARM64-${{ needs.check-release.outputs.tag }}
+          path: upstream/dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$RELEASE_TAG" upstream/dist/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG" \
+            --generate-notes
