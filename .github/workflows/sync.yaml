@@ -1,4 +1,3 @@
-
 name: Sync
 
 on:
@@ -455,11 +454,29 @@ jobs:
           fi
 
           KEYSTORE="android/app/keystore.jks"
-          EXPECTED_CERT=$(keytool -exportcert \
-            -keystore "$KEYSTORE" \
-            -storepass "$STORE_PASSWORD" \
-            -alias "$KEY_ALIAS" \
-            | sha256sum | awk '{print toupper($1)}')
+
+          if [[ ! -f "$KEYSTORE" ]]; then
+            echo "::error::Keystore not found: $KEYSTORE"
+            exit 1
+          fi
+
+          EXPECTED_CERT=$(
+            keytool -list -v \
+              -keystore "$KEYSTORE" \
+              -storepass "$STORE_PASSWORD" \
+              -alias "$KEY_ALIAS" \
+            | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' \
+            | head -n 1 \
+            | tr -d ':' \
+            | tr '[:lower:]' '[:upper:]'
+          )
+
+          if [[ -z "$EXPECTED_CERT" ]]; then
+            echo "::error::Could not read certificate fingerprint from keystore"
+            exit 1
+          fi
+
+          echo "Expected certificate SHA-256: $EXPECTED_CERT"
 
           for APK in "${APK_FILES[@]}"; do
             CODE=$("$APKANALYZER" manifest version-code "$APK")
@@ -481,11 +498,22 @@ jobs:
 
             "$APKSIGNER" verify --verbose "$APK"
 
-            ACTUAL_CERT=$("$APKSIGNER" verify --print-certs "$APK" \
+            ACTUAL_CERT=$(
+              "$APKSIGNER" verify --print-certs "$APK" \
               | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
-              | head -n 1 | tr -d ':' | tr '[:lower:]' '[:upper:]')
+              | head -n 1 \
+              | tr -d ':' \
+              | tr '[:lower:]' '[:upper:]'
+            )
 
-            if [[ -z "$ACTUAL_CERT" || "$ACTUAL_CERT" != "$EXPECTED_CERT" ]]; then
+            echo "Actual certificate SHA-256:   $ACTUAL_CERT"
+
+            if [[ -z "$ACTUAL_CERT" ]]; then
+              echo "::error::Could not read certificate fingerprint from APK: $APK"
+              exit 1
+            fi
+
+            if [[ "$ACTUAL_CERT" != "$EXPECTED_CERT" ]]; then
               echo "::error::APK signing certificate does not match the configured keystore: $APK"
               exit 1
             fi
