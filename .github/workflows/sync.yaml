@@ -1,9 +1,9 @@
 name: Sync
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,19 +14,19 @@ concurrency:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
-  UPSTREAM_REPO: appshubcc/Bettbox
-  CUSTOM_REPO: Starry398/Bettbox
+  SENTRY_BACKEND: none
+  IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
 
 jobs:
   check-release:
     name: Check upstream release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
-      upstream_tag: ${{ steps.release.outputs.tag }}
-      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.release.outputs.tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
 
     steps:
-      - name: Get latest stable release
+      - name: Find latest stable upstream release
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,32 +34,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" \
-            --jq '.tag_name')
+          RELEASE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/appshubcc/Bettbox/releases/latest)
 
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "::error::Could not find the latest stable release."
+          TAG=$(echo "$RELEASE" | jq -er '.tag_name')
+
+          if ! [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream stable release tag: $TAG"
             exit 1
           fi
 
+          echo "Upstream release: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Latest upstream release: $TAG"
 
-      - name: Check whether this release already exists
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.release.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if gh release view "$TAG" \
-            --repo "$CUSTOM_REPO" >/dev/null 2>&1; then
-            echo "Release $TAG already exists."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists in this repository."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Release $TAG does not exist."
+            echo "Release $TAG does not exist yet."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -67,260 +61,373 @@ jobs:
     name: Build Bettbox Android ARM64
     needs: check-release
     if: needs.check-release.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout upstream source
+      - name: Checkout upstream release source
         uses: actions/checkout@v4
         with:
           repository: appshubcc/Bettbox
-          ref: ${{ needs.check-release.outputs.upstream_tag }}
+          ref: ${{ needs.check-release.outputs.tag }}
+          fetch-depth: 0
+          submodules: recursive
           path: upstream
-          fetch-depth: 1
 
-      - name: Checkout custom files
+      - name: Checkout custom XML files
         uses: actions/checkout@v4
         with:
-          repository: Starry398/Bettbox
-          ref: main
+          repository: ${{ github.repository }}
           path: custom-files
           sparse-checkout: |
             starry/xml
             starry/images
           sparse-checkout-cone-mode: true
 
-      - name: Apply custom resources
+      - name: Restore custom XML resources
         working-directory: upstream
         shell: bash
         run: |
           set -euo pipefail
 
-          # Apply custom XML files.
-          XML_SOURCE="../custom-files/starry/xml"
-          XML_TARGET="android/app/src/main/res/drawable"
-
-          mkdir -p "$XML_TARGET"
+          SOURCE="../custom-files/starry/xml"
+          TARGET="android/app/src/main/res/drawable"
 
           for file in \
             splash_text_dark.xml \
             splash_text_light.xml \
             ic_launcher_foreground_dark.xml \
-            ic_launcher_foreground_light.xml; do
-            if [ ! -f "$XML_SOURCE/$file" ]; then
-              echo "::error::Missing custom XML: $XML_SOURCE/$file"
+            ic_launcher_foreground_light.xml
+          do
+            test -f "$SOURCE/$file" || {
+              echo "::error::Missing custom resource: $SOURCE/$file"
               exit 1
-            fi
+            }
 
-            cp "$XML_SOURCE/$file" "$XML_TARGET/$file"
-            echo "Applied custom XML: $file"
+            test -f "$TARGET/$file" || {
+              echo "::error::Upstream resource not found: $TARGET/$file"
+              exit 1
+            }
+
+            cp "$SOURCE/$file" "$TARGET/$file"
+            echo "Restored $file"
           done
 
-          # Apply custom About-page icon.
+          # Restore custom About-page icon.
           ICON_SOURCE="../custom-files/starry/images/icon.png"
           ICON_TARGET="assets/images/icon.png"
 
-          if [ ! -f "$ICON_SOURCE" ]; then
-            echo "::error::Custom icon not found: $ICON_SOURCE"
+          test -f "$ICON_SOURCE" || {
+            echo "::error::Missing custom icon: $ICON_SOURCE"
             exit 1
-          fi
+          }
 
-          if [ ! -f "$ICON_TARGET" ]; then
+          test -f "$ICON_TARGET" || {
             echo "::error::Upstream icon not found: $ICON_TARGET"
             exit 1
-          fi
+          }
 
           cp "$ICON_SOURCE" "$ICON_TARGET"
-          echo "Applied custom icon: $ICON_TARGET"
+          echo "Restored custom icon: $ICON_TARGET"
 
-      - name: Set up Java
+      - name: Read upstream toolchain versions
+        id: toolchain
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE=".github/workflows/build.yaml"
+
+          test -f "$FILE" || {
+            echo "::error::Upstream build workflow not found: $FILE"
+            exit 1
+          }
+
+          NDK_VERSION=$(sed -nE \
+            's/^[[:space:]]*NDK_VERSION="([^"]+)".*/\1/p' \
+            "$FILE" | head -n 1)
+
+          FLUTTER_VERSION=$(grep -E '^[[:space:]]*flutter-version:' "$FILE" \
+            | grep -oE "'[0-9]+\.[0-9]+\.[0-9]+'" \
+            | tail -n 1 | tr -d "'")
+
+          GO_VERSION=$(grep -E '^[[:space:]]*go-version:' "$FILE" \
+            | grep -oE "'[0-9]+\.[0-9]+\.x'" \
+            | tail -n 1 | tr -d "'")
+
+          if [[ -z "$NDK_VERSION" || -z "$FLUTTER_VERSION" || -z "$GO_VERSION" ]]; then
+            echo "::error::Failed to parse Flutter, Go or NDK version from upstream build.yaml"
+            echo "Please inspect the upstream workflow format."
+            exit 1
+          fi
+
+          echo "Flutter version: $FLUTTER_VERSION"
+          echo "Go version: $GO_VERSION"
+          echo "NDK version: $NDK_VERSION"
+
+          echo "flutter_version=$FLUTTER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "ndk_version=$NDK_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set application version and automatic build number
+        id: app-version
+        working-directory: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_VERSION=$(sed -nE \
+            's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' \
+            pubspec.yaml | head -n 1)
+
+          if [[ -z "$ORIGINAL_VERSION" ]]; then
+            echo "::error::Cannot find version in pubspec.yaml"
+            exit 1
+          fi
+
+          VERSION_NAME="${ORIGINAL_VERSION%%+*}"
+
+          if ! [[ "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected upstream version: $VERSION_NAME"
+            exit 1
+          fi
+
+          DATE_BASE=$(date -u +%Y%m%d)
+          TODAY=$(date -u +%Y-%m-%d)
+
+          RUNS=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sync.yaml/runs?created=${TODAY}T00:00:00Z..${TODAY}T23:59:59Z&per_page=100")
+
+          DAY_RUN=$(echo "$RUNS" | jq -er '.workflow_runs | length')
+
+          if (( DAY_RUN < 1 )); then
+            echo "::error::Unable to determine today's workflow run count"
+            exit 1
+          fi
+
+          VERSION_CODE=$((10#$DATE_BASE * 100 + DAY_RUN))
+
+          if (( VERSION_CODE > 2100000000 )); then
+            echo "::error::Android versionCode exceeds the supported limit"
+            exit 1
+          fi
+
+          sed -i -E \
+            "s/^version:.*/version: ${VERSION_NAME}+${VERSION_CODE}/" \
+            pubspec.yaml
+
+          echo "Upstream version: $ORIGINAL_VERSION"
+          echo "New Flutter version: ${VERSION_NAME}+${VERSION_CODE}"
+          echo "EXPECTED_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "EXPECTED_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+          grep '^version:' pubspec.yaml
+
+      - name: Set custom application ID
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="android/app/build.gradle.kts"
+
+          grep -Fq 'applicationId = "com.appshub.bettbox"' "$FILE" || {
+            echo "::error::Expected applicationId was not found. Check upstream Gradle configuration."
+            exit 1
+          }
+
+          sed -i \
+            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.starry"/' \
+            "$FILE"
+
+          grep -F 'applicationId =' "$FILE"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
-      - name: Set up Flutter
+      - name: Setup Android NDK
+        shell: bash
+        env:
+          NDK_VERSION: ${{ steps.toolchain.outputs.ndk_version }}
+        run: |
+          set -euo pipefail
+
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;${NDK_VERSION}" >/dev/null 2>&1 || true
+
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+
+          test -d "$NDK_PATH" || {
+            echo "::error::Android NDK $NDK_VERSION was not installed"
+            exit 1
+          }
+
+          echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK_PATH"
+
+      - name: Configure Cargo for Android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.cargo
+
+          cat > ~/.cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          EOF
+
+          cat ~/.cargo/config.toml
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache-dependency-path: upstream/core/go.sum
+
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: '3.47.7'
+          flutter-version: ${{ steps.toolchain.outputs.flutter_version }}
           cache: true
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.27.1'
-          cache: true
-
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28c
-          link-to-sdk: true
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Configure Android build environment
+      - name: Clear Pub Cache Credentials
         shell: bash
-        run: |
-          set -euo pipefail
+        run: rm -f ~/.pub-cache/credentials.json || true
 
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
-          if [ -z "$SDK" ]; then
-            echo "::error::Android SDK path not found."
-            exit 1
-          fi
-
-          NDK="${ANDROID_NDK_HOME:-}"
-
-          if [ -z "$NDK" ]; then
-            NDK=$(find "$SDK/ndk" \
-              -mindepth 1 -maxdepth 1 -type d \
-              | sort -V | tail -n 1)
-          fi
-
-          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
-            echo "::error::Android NDK was not found."
-            exit 1
-          fi
-
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
-
-          echo "Using Android SDK: $SDK"
-          echo "Using Android NDK: $NDK"
-
-      - name: Configure custom application ID
+      - name: Setup Android signing
         working-directory: upstream
         shell: bash
-        run: |
-          set -euo pipefail
-
-          GRADLE_FILE="android/app/build.gradle"
-          KTS_FILE="android/app/build.gradle.kts"
-
-          if [ -f "$GRADLE_FILE" ]; then
-            sed -i \
-              's/com\.appshub\.bettbox/com.appshub.bettbox.starry/g' \
-              "$GRADLE_FILE"
-          elif [ -f "$KTS_FILE" ]; then
-            sed -i \
-              's/com\.appshub\.bettbox/com.appshub.bettbox.starry/g' \
-              "$KTS_FILE"
-          else
-            echo "::error::Android app Gradle file not found."
-            exit 1
-          fi
-
-          if ! grep -R -q \
-            'com\.appshub\.bettbox\.starry' \
-            android/app; then
-            echo "::error::Custom application ID was not applied."
-            exit 1
-          fi
-
-      - name: Configure version
-        working-directory: upstream
         env:
-          UPSTREAM_TAG: ${{ needs.check-release.outputs.upstream_tag }}
-          RUN_NUMBER: ${{ github.run_number }}
-        shell: bash
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          VERSION="${UPSTREAM_TAG#v}"
-          VERSION="${VERSION#V}"
+          for name in KEYSTORE KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
 
-          if ! grep -q '^version:' pubspec.yaml; then
-            echo "::error::Could not find version in pubspec.yaml."
-            exit 1
-          fi
+          printf '%s' "$KEYSTORE" | base64 --decode > android/app/keystore.jks
 
-          sed -i \
-            -E "s/^version:.*/version: ${VERSION}+${RUN_NUMBER}/" \
-            pubspec.yaml
+          {
+            echo "storeFile=keystore.jks"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> android/local.properties
 
-          grep '^version:' pubspec.yaml
+          keytool -list \
+            -keystore android/app/keystore.jks \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
 
-      - name: Install Flutter dependencies
+      - name: Clean Android build
         working-directory: upstream
+        shell: bash
+        run: flutter clean
+
+      - name: Build Bettbox Android ARM64
+        working-directory: upstream
+        shell: bash
+        env:
+          SENTRY_DSN: ''
         run: |
-          flutter clean
+          set -euo pipefail
+
           flutter pub get
-
-      - name: Generate project files
-        working-directory: upstream
-        run: |
-          dart run build_runner build --delete-conflicting-outputs
-
-      - name: Build Android ARM64 APK
-        working-directory: upstream
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          dart run build_runner build
           dart setup.dart android --arch arm64 --env stable
 
-          echo "Generated APK files:"
-          find . -type f -name '*.apk' -print
-
-      - name: Collect APK
-        id: apk
+      - name: Verify APK and version code
         working-directory: upstream
-        env:
-          UPSTREAM_TAG: ${{ needs.check-release.outputs.upstream_tag }}
         shell: bash
         run: |
           set -euo pipefail
 
-          APK=$(find . -type f -name '*.apk' \
-            -path '*/build/*' \
-            ! -name '*debug*' \
-            | head -n 1)
+          shopt -s nullglob
+          APK_FILES=(dist/*.apk)
 
-          if [ -z "$APK" ]; then
-            echo "::error::No release APK was found."
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo "::error::No APK files found in dist/"
             exit 1
           fi
 
-          mkdir -p ../release-files
+          APKANALYZER=$(find "${ANDROID_SDK_ROOT}/cmdline-tools" \
+            -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
 
-          OUTPUT="../release-files/Bettbox-${UPSTREAM_TAG}-arm64.apk"
-          cp "$APK" "$OUTPUT"
+          if [[ -z "$APKANALYZER" ]]; then
+            APKANALYZER=$(find "${ANDROID_SDK_ROOT}/build-tools" \
+              -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+          fi
 
-          echo "path=release-files/$(basename "$OUTPUT")" \
-            >> "$GITHUB_OUTPUT"
+          if [[ -z "$APKANALYZER" ]]; then
+            echo "::error::apkanalyzer not found; cannot verify APK version"
+            exit 1
+          fi
+
+          VERIFIED=0
+
+          for APK in "${APK_FILES[@]}"; do
+            CODE=$("$APKANALYZER" manifest version-code "$APK")
+            NAME=$("$APKANALYZER" manifest version-name "$APK")
+
+            echo "APK: $APK"
+            echo "versionName: $NAME"
+            echo "versionCode: $CODE"
+
+            if [[ "$CODE" != "$EXPECTED_VERSION_CODE" ]]; then
+              echo "::error::Unexpected versionCode in $APK: $CODE (expected $EXPECTED_VERSION_CODE)"
+              exit 1
+            fi
+
+            if [[ "$NAME" != "$EXPECTED_VERSION_NAME" ]]; then
+              echo "::error::Unexpected versionName in $APK (expected $EXPECTED_VERSION_NAME)"
+              exit 1
+            fi
+
+            VERIFIED=$((VERIFIED + 1))
+          done
+
+          echo "Verified $VERIFIED APK file(s)."
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Bettbox-${{ needs.check-release.outputs.upstream_tag }}-arm64
-          path: ${{ steps.apk.outputs.path }}
+          name: Bettbox-Android-ARM64-${{ needs.check-release.outputs.tag }}
+          path: upstream/dist/*.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.check-release.outputs.upstream_tag }}
-          APK_PATH: ${{ steps.apk.outputs.path }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
 
-          gh release create "$TAG" "$APK_PATH" \
-            --repo "$CUSTOM_REPO" \
-            --title "Bettbox $TAG (Starry)" \
-            --notes "自编译 Bettbox Android ARM64 版本。
-
-          - 上游版本：$TAG
-          - 自定义包名：com.appshub.bettbox.starry
-          - 包含自定义图标与资源
-
-          源码：https://github.com/Starry398/Bettbox
-          上游：https://github.com/appshubcc/Bettbox"
+          gh release create "$RELEASE_TAG" upstream/dist/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG" \
+            --generate-notes
