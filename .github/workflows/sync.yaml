@@ -1,3 +1,4 @@
+
 name: Sync
 
 on:
@@ -73,7 +74,7 @@ jobs:
           submodules: recursive
           path: upstream
 
-      - name: Checkout custom XML files
+      - name: Checkout custom resources and patches
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
@@ -81,6 +82,7 @@ jobs:
           sparse-checkout: |
             starry/xml
             starry/images
+            starry/patch
           sparse-checkout-cone-mode: true
 
       - name: Restore custom XML resources
@@ -92,42 +94,97 @@ jobs:
           SOURCE="../custom-files/starry/xml"
           TARGET="android/app/src/main/res/drawable"
 
-          for file in \
-            splash_text_dark.xml \
-            splash_text_light.xml \
-            ic_launcher_foreground_dark.xml \
-            ic_launcher_foreground_light.xml
-          do
-            test -f "$SOURCE/$file" || {
-              echo "::error::Missing custom resource: $SOURCE/$file"
-              exit 1
-            }
-
-            test -f "$TARGET/$file" || {
-              echo "::error::Upstream resource not found: $TARGET/$file"
-              exit 1
-            }
-
-            cp "$SOURCE/$file" "$TARGET/$file"
-            echo "Restored $file"
-          done
-
-          # Restore custom About-page icon.
-          ICON_SOURCE="../custom-files/starry/images/icon.png"
-          ICON_TARGET="assets/images/icon.png"
-
-          test -f "$ICON_SOURCE" || {
-            echo "::error::Missing custom icon: $ICON_SOURCE"
+          test -d "$SOURCE" || {
+            echo "::error::Custom XML directory not found: $SOURCE"
             exit 1
           }
 
-          test -f "$ICON_TARGET" || {
-            echo "::error::Upstream icon not found: $ICON_TARGET"
+          test -d "$TARGET" || {
+            echo "::error::Upstream drawable directory not found: $TARGET"
             exit 1
           }
 
-          cp "$ICON_SOURCE" "$ICON_TARGET"
-          echo "Restored custom icon: $ICON_TARGET"
+          XML_COUNT=0
+
+          while IFS= read -r -d '' file; do
+            filename=$(basename "$file")
+
+            if ! [[ "$filename" =~ ^[a-z0-9_]+\.xml$ ]]; then
+              echo "::error::Invalid Android resource filename: $filename"
+              exit 1
+            fi
+
+            cp -f "$file" "$TARGET/$filename"
+            echo "Restored XML: $filename"
+            XML_COUNT=$((XML_COUNT + 1))
+          done < <(find "$SOURCE" -maxdepth 1 -type f -name '*.xml' -print0)
+
+          echo "Restored $XML_COUNT custom XML file(s)."
+
+      - name: Restore custom image resources
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE="../custom-files/starry/images"
+          TARGET="assets/images"
+
+          test -d "$SOURCE" || {
+            echo "::error::Custom images directory not found: $SOURCE"
+            exit 1
+          }
+
+          test -d "$TARGET" || {
+            echo "::error::Upstream images directory not found: $TARGET"
+            exit 1
+          }
+
+          IMAGE_COUNT=0
+
+          while IFS= read -r -d '' file; do
+            filename=$(basename "$file")
+            cp -f "$file" "$TARGET/$filename"
+            echo "Restored image/resource: $filename"
+            IMAGE_COUNT=$((IMAGE_COUNT + 1))
+          done < <(find "$SOURCE" -maxdepth 1 -type f -print0)
+
+          echo "Restored $IMAGE_COUNT custom image/resource file(s)."
+
+      - name: Apply custom patches
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_DIR="../custom-files/starry/patch"
+
+          test -d "$PATCH_DIR" || {
+            echo "::error::Patch directory not found: $PATCH_DIR"
+            exit 1
+          }
+
+          shopt -s nullglob
+          PATCHES=("$PATCH_DIR"/*.patch)
+
+          if (( ${#PATCHES[@]} == 0 )); then
+            echo "No .patch files found. Skipping custom patches."
+          else
+            for patch in "${PATCHES[@]}"; do
+              echo "Checking patch: $(basename "$patch")"
+
+              if ! git apply --check "$patch"; then
+                echo "::error::Patch cannot be applied: $(basename "$patch")"
+                echo "The patch may conflict with upstream source or an earlier patch."
+                exit 1
+              fi
+
+              git apply "$patch"
+              echo "Applied patch: $(basename "$patch")"
+            done
+
+            echo "Applied ${#PATCHES[@]} custom patch(es)."
+          fi
 
       - name: Read upstream toolchain versions
         id: toolchain
@@ -359,9 +416,12 @@ jobs:
           dart run build_runner build
           dart setup.dart android --arch arm64 --env stable
 
-      - name: Verify APK and version code
+      - name: Verify APK version and signature
         working-directory: upstream
         shell: bash
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           set -euo pipefail
 
@@ -386,7 +446,20 @@ jobs:
             exit 1
           fi
 
-          VERIFIED=0
+          APKSIGNER=$(find "${ANDROID_SDK_ROOT}/build-tools" \
+            -type f -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+
+          if [[ -z "$APKSIGNER" ]]; then
+            echo "::error::apksigner not found; cannot verify APK signature"
+            exit 1
+          fi
+
+          KEYSTORE="android/app/keystore.jks"
+          EXPECTED_CERT=$(keytool -exportcert \
+            -keystore "$KEYSTORE" \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" \
+            | sha256sum | awk '{print toupper($1)}')
 
           for APK in "${APK_FILES[@]}"; do
             CODE=$("$APKANALYZER" manifest version-code "$APK")
@@ -406,10 +479,21 @@ jobs:
               exit 1
             fi
 
-            VERIFIED=$((VERIFIED + 1))
+            "$APKSIGNER" verify --verbose "$APK"
+
+            ACTUAL_CERT=$("$APKSIGNER" verify --print-certs "$APK" \
+              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+              | head -n 1 | tr -d ':' | tr '[:lower:]' '[:upper:]')
+
+            if [[ -z "$ACTUAL_CERT" || "$ACTUAL_CERT" != "$EXPECTED_CERT" ]]; then
+              echo "::error::APK signing certificate does not match the configured keystore: $APK"
+              exit 1
+            fi
+
+            echo "Signature verified: $APK"
           done
 
-          echo "Verified $VERIFIED APK file(s)."
+          echo "Verified ${#APK_FILES[@]} APK file(s)."
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
