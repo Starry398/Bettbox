@@ -1,13 +1,10 @@
 diff --git a/lib/views/about.dart b/lib/views/about.dart
 --- a/lib/views/about.dart
 +++ b/lib/views/about.dart
-@@ -1,7 +1,20 @@
-       _LinkTile(
-         prefix: 'Powered by',
-         title: 'Mihomo',
-         icon: Icons.memory,
-         onTap: () => globalState.openUrl('https://github.com/MetaCubeX/mihomo'),
-       ),
+@@ -1,6 +1,19 @@
+-      ),
+-    ];
++      ),
 +      _LinkTile(
 +        title: 'GitHub Releases',
 +        icon: Icons.star,
@@ -21,4 +18,4 @@ diff --git a/lib/views/about.dart b/lib/views/about.dart
 +        external: false,
 +        onTap: () => _checkUpdate(context),
 +      ),
-     ];
++    ];
