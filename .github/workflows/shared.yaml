@@ -1,3 +1,4 @@
+
 name: Shared
 
 on:
@@ -119,8 +120,8 @@ jobs:
 
           echo "Restored $XML_COUNT custom XML file(s)."
 
-      # 5. 覆盖自定义图片资源
-      - name: Restore custom image resources
+      # 5. 分别复制应用图标资源和贡献者头像
+      - name: Restore custom images
         working-directory: upstream
         shell: bash
         run: |
@@ -129,8 +130,8 @@ jobs:
           SOURCE="../custom-files/starry/images"
           TARGET="assets/images"
 
-          test -d "$SOURCE" || {
-            echo "::error::Custom images directory not found: $SOURCE"
+          test -f "$SOURCE/icon.png" || {
+            echo "::error::Custom icon not found: $SOURCE/icon.png"
             exit 1
           }
 
@@ -139,18 +140,22 @@ jobs:
             exit 1
           }
 
-          IMAGE_COUNT=0
+          # 只复制指定的 icon.png，不复制其他第一层图片
+          cp -f "$SOURCE/icon.png" "$TARGET/icon.png"
+          echo "Restored application image resource: icon.png"
 
-          while IFS= read -r -d '' file; do
-            filename=$(basename "$file")
-            cp -f "$file" "$TARGET/$filename"
-            echo "Restored image/resource: $filename"
-            IMAGE_COUNT=$((IMAGE_COUNT + 1))
-          done < <(
-            find "$SOURCE" -maxdepth 1 -type f -print0
-          )
+          # 复制 avatars 目录中的头像
+          AVATAR_SOURCE="$SOURCE/avatars"
+          AVATAR_TARGET="$TARGET/avatars"
 
-          echo "Restored $IMAGE_COUNT custom image/resource file(s)."
+          if [[ -d "$AVATAR_SOURCE" ]]; then
+            mkdir -p "$AVATAR_TARGET"
+            cp -r "$AVATAR_SOURCE/." "$AVATAR_TARGET/"
+            echo "Restored custom avatars."
+          else
+            echo "::error::Custom avatars directory not found: $AVATAR_SOURCE"
+            exit 1
+          fi
 
       # 6. 应用自定义补丁
       - name: Apply custom patches
