@@ -62,7 +62,7 @@ jobs:
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
 
-            if [[ "$tag" =~ ^${BASE_VERSION//./\\.}-pre\.([0-9]+)$ ]]; then
+            if [[ "$tag" =~ ^v?${BASE_VERSION//./\\.}-pre\.([0-9]+)$ ]]; then
               NUMBER="${BASH_REMATCH[1]}"
 
               # Avoid interpreting leading zeros as octal.
@@ -76,10 +76,11 @@ jobs:
 
           NEXT_PRE=$((MAX_PRE + 1))
           VERSION_NAME="${PREFIX}${NEXT_PRE}"
-          RELEASE_TAG="$VERSION_NAME"
+          RELEASE_TAG="v${VERSION_NAME}"
 
           echo "Previous highest pre-release number: $MAX_PRE"
           echo "Next version: $VERSION_NAME"
+          echo "Release tag: $RELEASE_TAG"
 
           echo "source_tag=$SOURCE_TAG" >> "$GITHUB_OUTPUT"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
