@@ -1,4 +1,4 @@
-name: pre
+name: Pre
 
 on:
   workflow_dispatch:
