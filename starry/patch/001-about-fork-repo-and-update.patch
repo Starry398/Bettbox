@@ -1,0 +1,113 @@
+diff --git a/lib/common/constant.dart b/lib/common/constant.dart
+index dcfff980..0a69b1f5 100644
+--- a/lib/common/constant.dart
++++ b/lib/common/constant.dart
+@@ -44,6 +44,7 @@ const customSidebarIconKey = 'custom_sidebar_icon';
+ const customDashboardTitleKey = 'custom_dashboard_title';
+ const double dialogCommonWidth = 300;
+ const repository = 'appshubcc/Bettbox';
++const forkRepository = 'Starry398/Bettbox';
+ const ipInfoToken = String.fromEnvironment('IPINFO_TOKEN', defaultValue: '');
+ const defaultExternalController = '127.0.0.1:9090';
+ const maxMobileWidth = 600;
+diff --git a/lib/common/request.dart b/lib/common/request.dart
+index 32002723..edcdd164 100644
+--- a/lib/common/request.dart
++++ b/lib/common/request.dart
+@@ -254,11 +254,11 @@ class Request {
+     return MemoryImage(bytes);
+   }
+ 
+-  Future<Map<String, dynamic>?> checkForUpdate() async {
++  Future<Map<String, dynamic>?> checkForUpdate({String repo = repository}) async {
+     try {
+       final t = DateTime.now().millisecondsSinceEpoch;
+       final response = await _dio.get(
+-        'https://github.com/$repository/releases/latest?t=$t',
++        'https://github.com/$repo/releases/latest?t=$t',
+         options: Options(
+           followRedirects: false,
+           validateStatus: (status) =>
+@@ -279,7 +279,7 @@ class Request {
+           if (!hasUpdate) return null;
+           return {
+             'tag_name': remoteVersion,
+-            'html_url': 'https://github.com/$repository/releases/latest',
++            'html_url': 'https://github.com/$repo/releases/latest',
+             'body': 'New version available. Please visit GitHub to download.',
+           };
+         }
+diff --git a/lib/controller.dart b/lib/controller.dart
+index 566230fb..575ff8ec 100644
+--- a/lib/controller.dart
++++ b/lib/controller.dart
+@@ -1183,6 +1183,7 @@ class AppController {
+   Future<void> checkUpdateResultHandle({
+     Map<String, dynamic>? data,
+     bool handleError = false,
++    String repo = repository,
+   }) async {
+     if (globalState.isPre && !handleError) {
+       return;
+@@ -1209,7 +1210,7 @@ class AppController {
+         return;
+       }
+       const String assetSuffix = String.fromEnvironment('APP_ASSET_SUFFIX');
+-      String downloadUrl = 'https://github.com/$repository/releases/latest';
++      String downloadUrl = 'https://github.com/$repo/releases/latest';
+ 
+       if (assetSuffix.isNotEmpty) {
+         final versionWithoutV = tagName.startsWith('v')
+@@ -1220,7 +1221,7 @@ class AppController {
+           finalSuffix = 'windows-amd64-compatible-portable.zip';
+         }
+         downloadUrl =
+-            'https://github.com/$repository/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
++            'https://github.com/$repo/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
+       }
+ 
+       globalState.openUrl(downloadUrl);
+diff --git a/lib/views/about.dart b/lib/views/about.dart
+index 1ac6738a..96a04618 100644
+--- a/lib/views/about.dart
++++ b/lib/views/about.dart
+@@ -33,6 +33,21 @@ class AboutView extends StatelessWidget {
+     );
+   }
+ 
++  Future<void> _checkForkUpdate(BuildContext context) async {
++    final commonScaffoldState = context.commonScaffoldState;
++    if (commonScaffoldState?.mounted != true) return;
++    final data = await globalState.appController.safeRun<Map<String, dynamic>?>(
++      () => request.checkForUpdate(repo: forkRepository),
++      title: appLocalizations.checkUpdate,
++      needLoading: true,
++    );
++    globalState.appController.checkUpdateResultHandle(
++      data: data,
++      handleError: true,
++      repo: forkRepository,
++    );
++  }
++
+   List<Widget> _buildMoreSection(BuildContext context) {
+     final links = [
+       _LinkTile(
+@@ -70,6 +85,17 @@ class AboutView extends StatelessWidget {
+         icon: Icons.memory,
+         onTap: () => globalState.openUrl('https://github.com/MetaCubeX/mihomo'),
+       ),
++      _LinkTile(
++        title: '我的 GitHub 仓库',
++        icon: Icons.fork_right,
++        onTap: () => globalState.openUrl('https://github.com/$forkRepository'),
++      ),
++      _LinkTile(
++        title: '检查 Fork 更新',
++        icon: Icons.refresh,
++        external: false,
++        onTap: () => _checkForkUpdate(context),
++      ),
+     ];
+     return generateSection(
+       title: appLocalizations.more,
