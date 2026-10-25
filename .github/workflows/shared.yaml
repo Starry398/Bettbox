@@ -120,7 +120,7 @@ jobs:
 
           echo "Restored $XML_COUNT custom XML file(s)."
 
-      # 5. 分别复制应用图标资源和贡献者头像
+      # 5. 只复制自定义应用图标，不再复制头像
       - name: Restore custom images
         working-directory: upstream
         shell: bash
@@ -144,18 +144,8 @@ jobs:
           cp -f "$SOURCE/icon.png" "$TARGET/icon.png"
           echo "Restored application image resource: icon.png"
 
-          # 复制 avatars 目录中的头像
-          AVATAR_SOURCE="$SOURCE/avatars"
-          AVATAR_TARGET="$TARGET/avatars"
-
-          if [[ -d "$AVATAR_SOURCE" ]]; then
-            mkdir -p "$AVATAR_TARGET"
-            cp -r "$AVATAR_SOURCE/." "$AVATAR_TARGET/"
-            echo "Restored custom avatars."
-          else
-            echo "::error::Custom avatars directory not found: $AVATAR_SOURCE"
-            exit 1
-          fi
+          # 不再要求 avatars 目录存在，也不复制任何自定义头像
+          echo "Skipping custom avatars."
 
       # 6. 应用自定义补丁
       - name: Apply custom patches
