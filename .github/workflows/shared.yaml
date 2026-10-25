@@ -1,0 +1,644 @@
+name: Shared
+
+on:
+  workflow_call:
+    inputs:
+      source_tag:
+        description: Upstream Bettbox tag to build
+        required: true
+        type: string
+      version_name:
+        description: Android versionName
+        required: true
+        type: string
+      release_tag:
+        description: GitHub Release tag
+        required: true
+        type: string
+      prerelease:
+        description: Whether this is a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
+  SENTRY_BACKEND: none
+  IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
+
+jobs:
+  build:
+    name: Build Bettbox Android ARM64
+    runs-on: ubuntu-24.04
+
+    steps:
+      # 1. 获取仓库默认分支名称
+      - name: Get repository default branch
+        id: default-branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          BRANCH=$(gh api "repos/${REPOSITORY}" --jq '.default_branch')
+
+          if [[ -z "$BRANCH" ]]; then
+            echo "::error::Could not determine repository default branch"
+            exit 1
+          fi
+
+          echo "Default branch: $BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # 2. 获取上游指定版本源码
+      - name: Checkout upstream release source
+        uses: actions/checkout@v4
+        with:
+          repository: appshubcc/Bettbox
+          ref: ${{ inputs.source_tag }}
+          fetch-depth: 0
+          submodules: recursive
+          path: upstream
+
+      # 3. 获取自己的自定义资源、补丁和版本计数器
+      - name: Checkout custom files
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.default-branch.outputs.name }}
+          token: ${{ github.token }}
+          path: custom-files
+          sparse-checkout: |
+            starry/xml
+            starry/images
+            starry/patch
+            starry/txt/versioncode.txt
+          sparse-checkout-cone-mode: false
+
+      # 4. 覆盖自定义 XML 资源
+      - name: Restore custom XML resources
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE="../custom-files/starry/xml"
+          TARGET="android/app/src/main/res/drawable"
+
+          test -d "$SOURCE" || {
+            echo "::error::Custom XML directory not found: $SOURCE"
+            exit 1
+          }
+
+          test -d "$TARGET" || {
+            echo "::error::Upstream drawable directory not found: $TARGET"
+            exit 1
+          }
+
+          XML_COUNT=0
+
+          while IFS= read -r -d '' file; do
+            filename=$(basename "$file")
+
+            if ! [[ "$filename" =~ ^[a-z0-9_]+\.xml$ ]]; then
+              echo "::error::Invalid Android resource filename: $filename"
+              exit 1
+            fi
+
+            cp -f "$file" "$TARGET/$filename"
+            echo "Restored XML: $filename"
+            XML_COUNT=$((XML_COUNT + 1))
+          done < <(
+            find "$SOURCE" -maxdepth 1 -type f -name '*.xml' -print0
+          )
+
+          echo "Restored $XML_COUNT custom XML file(s)."
+
+      # 5. 覆盖自定义图片资源
+      - name: Restore custom image resources
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE="../custom-files/starry/images"
+          TARGET="assets/images"
+
+          test -d "$SOURCE" || {
+            echo "::error::Custom images directory not found: $SOURCE"
+            exit 1
+          }
+
+          test -d "$TARGET" || {
+            echo "::error::Upstream images directory not found: $TARGET"
+            exit 1
+          }
+
+          IMAGE_COUNT=0
+
+          while IFS= read -r -d '' file; do
+            filename=$(basename "$file")
+            cp -f "$file" "$TARGET/$filename"
+            echo "Restored image/resource: $filename"
+            IMAGE_COUNT=$((IMAGE_COUNT + 1))
+          done < <(
+            find "$SOURCE" -maxdepth 1 -type f -print0
+          )
+
+          echo "Restored $IMAGE_COUNT custom image/resource file(s)."
+
+      # 6. 应用自定义补丁
+      - name: Apply custom patches
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_DIR="../custom-files/starry/patch"
+
+          test -d "$PATCH_DIR" || {
+            echo "::error::Patch directory not found: $PATCH_DIR"
+            exit 1
+          }
+
+          shopt -s nullglob
+          PATCHES=("$PATCH_DIR"/*.patch)
+
+          if (( ${#PATCHES[@]} == 0 )); then
+            echo "No .patch files found. Skipping custom patches."
+          else
+            for patch in "${PATCHES[@]}"; do
+              echo "Checking patch: $(basename "$patch")"
+
+              if ! git apply --check "$patch"; then
+                echo "::error::Patch cannot be applied: $(basename "$patch")"
+                echo "The patch may conflict with upstream source or an earlier patch."
+                exit 1
+              fi
+
+              git apply "$patch"
+              echo "Applied patch: $(basename "$patch")"
+            done
+
+            echo "Applied ${#PATCHES[@]} custom patch(es)."
+          fi
+
+      # 7. 读取上游工具链版本
+      - name: Read upstream toolchain versions
+        id: toolchain
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE=".github/workflows/build.yaml"
+
+          test -f "$FILE" || {
+            echo "::error::Upstream build workflow not found: $FILE"
+            exit 1
+          }
+
+          NDK_VERSION=$(sed -nE \
+            's/^[[:space:]]*NDK_VERSION="([^"]+)".*/\1/p' \
+            "$FILE" | head -n 1)
+
+          FLUTTER_VERSION=$(grep -E '^[[:space:]]*flutter-version:' "$FILE" \
+            | grep -oE "'[0-9]+\.[0-9]+\.[0-9]+'" \
+            | tail -n 1 | tr -d "'")
+
+          GO_VERSION=$(grep -E '^[[:space:]]*go-version:' "$FILE" \
+            | grep -oE "'[0-9]+\.[0-9]+\.x'" \
+            | tail -n 1 | tr -d "'")
+
+          if [[ -z "$NDK_VERSION" ||
+                -z "$FLUTTER_VERSION" ||
+                -z "$GO_VERSION" ]]; then
+            echo "::error::Failed to parse Flutter, Go or NDK version from upstream build.yaml"
+            exit 1
+          fi
+
+          echo "Flutter version: $FLUTTER_VERSION"
+          echo "Go version: $GO_VERSION"
+          echo "NDK version: $NDK_VERSION"
+
+          echo "flutter_version=$FLUTTER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "ndk_version=$NDK_VERSION" >> "$GITHUB_OUTPUT"
+
+      # 8. 校验版本并分配 versionCode
+      - name: Allocate next versionCode
+        id: app-version
+        working-directory: upstream
+        shell: bash
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid versionName: $VERSION_NAME"
+            exit 1
+          fi
+
+          if [[ -z "$SOURCE_TAG" || -z "$RELEASE_TAG" ]]; then
+            echo "::error::Source tag and release tag must not be empty"
+            exit 1
+          fi
+
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            if [[ ! "$VERSION_NAME" =~ -pre\.[1-9][0-9]*$ ]]; then
+              echo "::error::Prerelease version must end with -pre.N"
+              exit 1
+            fi
+          else
+            if [[ "$VERSION_NAME" == *-* ]]; then
+              echo "::error::Stable version must not contain a prerelease suffix"
+              exit 1
+            fi
+          fi
+
+          # 检查输入版本是否与上游 pubspec.yaml 版本一致。
+          UPSTREAM_VERSION=$(sed -nE \
+            's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' \
+            pubspec.yaml | head -n 1)
+
+          if [[ -z "$UPSTREAM_VERSION" ]]; then
+            echo "::error::Could not read upstream version from pubspec.yaml"
+            exit 1
+          fi
+
+          EXPECTED_BASE="${VERSION_NAME%%-*}"
+          UPSTREAM_BASE="${UPSTREAM_VERSION%%-*}"
+
+          if [[ "$EXPECTED_BASE" != "$UPSTREAM_BASE" ]]; then
+            echo "::error::Version mismatch: requested $VERSION_NAME, upstream pubspec version is $UPSTREAM_VERSION"
+            exit 1
+          fi
+
+          COUNTER="../custom-files/starry/txt/versioncode.txt"
+
+          test -f "$COUNTER" || {
+            echo "::error::Version counter not found: $COUNTER"
+            exit 1
+          }
+
+          PREVIOUS_CODE=$(tr -d '[:space:]' < "$COUNTER")
+
+          if ! [[ "$PREVIOUS_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid versionCode counter: $PREVIOUS_CODE"
+            exit 1
+          fi
+
+          VERSION_CODE=$((10#$PREVIOUS_CODE + 1))
+
+          if (( VERSION_CODE > 2100000000 )); then
+            echo "::error::Android versionCode exceeds the supported limit"
+            exit 1
+          fi
+
+          # 确认 pubspec.yaml 中存在可替换的版本字段。
+          if ! grep -qE '^version:[[:space:]]*' pubspec.yaml; then
+            echo "::error::Could not find version field in pubspec.yaml"
+            exit 1
+          fi
+
+          sed -i -E \
+            "s/^version:.*/version: ${VERSION_NAME}+${VERSION_CODE}/" \
+            pubspec.yaml
+
+          echo "Version name: $VERSION_NAME"
+          echo "Upstream version: $UPSTREAM_VERSION"
+          echo "Previous versionCode: $PREVIOUS_CODE"
+          echo "Allocated versionCode: $VERSION_CODE"
+
+          echo "EXPECTED_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "EXPECTED_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+
+      # 9. 修改应用包名
+      - name: Set custom application ID
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="android/app/build.gradle.kts"
+
+          grep -Fq 'applicationId = "com.appshub.bettbox"' "$FILE" || {
+            echo "::error::Expected applicationId was not found. Check upstream Gradle configuration."
+            exit 1
+          }
+
+          sed -i \
+            's/applicationId = "com.appshub.bettbox"/applicationId = "com.appshub.bettbox.starry"/' \
+            "$FILE"
+
+          grep -F 'applicationId =' "$FILE"
+
+      # 10. 配置 Rust
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      # 11. 配置 Java
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # 12. 安装上游要求的 Android NDK
+      - name: Setup Android NDK
+        shell: bash
+        env:
+          NDK_VERSION: ${{ steps.toolchain.outputs.ndk_version }}
+        run: |
+          set -euo pipefail
+
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;${NDK_VERSION}" >/dev/null 2>&1 || true
+
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+
+          test -d "$NDK_PATH" || {
+            echo "::error::Android NDK $NDK_VERSION was not installed"
+            exit 1
+          }
+
+          echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK_PATH"
+
+      # 13. 配置 Cargo Android linker
+      - name: Configure Cargo for Android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.cargo
+
+          cat > ~/.cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          EOF
+
+          cat ~/.cargo/config.toml
+
+      # 14. 配置 Go
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache-dependency-path: upstream/core/go.sum
+
+      # 15. 配置 Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.toolchain.outputs.flutter_version }}
+          cache: true
+
+      # 16. 清理 Pub 凭据
+      - name: Clear Pub Cache Credentials
+        shell: bash
+        run: rm -f ~/.pub-cache/credentials.json || true
+
+      # 17. 配置 Android 签名
+      - name: Setup Android signing
+        working-directory: upstream
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for name in KEYSTORE KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          printf '%s' "$KEYSTORE" | base64 --decode > android/app/keystore.jks
+
+          {
+            echo "storeFile=keystore.jks"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> android/local.properties
+
+          keytool -list \
+            -keystore android/app/keystore.jks \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+
+      # 18. 清理旧构建
+      - name: Clean Android build
+        working-directory: upstream
+        shell: bash
+        run: flutter clean
+
+      # 19. 构建 ARM64 APK
+      - name: Build Bettbox Android ARM64
+        working-directory: upstream
+        shell: bash
+        env:
+          SENTRY_DSN: ''
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+          dart run build_runner build
+          dart setup.dart android --arch arm64 --env stable
+
+      # 20. 验证 APK 版本和签名
+      - name: Verify APK version and signature
+        working-directory: upstream
+        shell: bash
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          APK_FILES=(dist/*.apk)
+
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo "::error::No APK files found in dist/"
+            exit 1
+          fi
+
+          APKANALYZER=$(find "${ANDROID_SDK_ROOT}/cmdline-tools" \
+            -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+
+          if [[ -z "$APKANALYZER" ]]; then
+            APKANALYZER=$(find "${ANDROID_SDK_ROOT}/build-tools" \
+              -type f -name apkanalyzer 2>/dev/null | head -n 1 || true)
+          fi
+
+          if [[ -z "$APKANALYZER" ]]; then
+            echo "::error::apkanalyzer not found; cannot verify APK version"
+            exit 1
+          fi
+
+          APKSIGNER=$(find "${ANDROID_SDK_ROOT}/build-tools" \
+            -type f -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+
+          if [[ -z "$APKSIGNER" ]]; then
+            echo "::error::apksigner not found; cannot verify APK signature"
+            exit 1
+          fi
+
+          KEYSTORE="android/app/keystore.jks"
+
+          if [[ ! -f "$KEYSTORE" ]]; then
+            echo "::error::Keystore not found: $KEYSTORE"
+            exit 1
+          fi
+
+          EXPECTED_CERT=$(
+            keytool -exportcert \
+              -keystore "$KEYSTORE" \
+              -storepass "$STORE_PASSWORD" \
+              -alias "$KEY_ALIAS" \
+            | sha256sum \
+            | awk '{print toupper($1)}'
+          )
+
+          if [[ -z "$EXPECTED_CERT" ]]; then
+            echo "::error::Could not read certificate fingerprint from keystore"
+            exit 1
+          fi
+
+          echo "Expected certificate SHA-256: $EXPECTED_CERT"
+
+          for APK in "${APK_FILES[@]}"; do
+            CODE=$("$APKANALYZER" manifest version-code "$APK")
+            NAME=$("$APKANALYZER" manifest version-name "$APK")
+
+            echo "APK: $APK"
+            echo "versionName: $NAME"
+            echo "versionCode: $CODE"
+
+            if [[ "$CODE" != "$EXPECTED_VERSION_CODE" ]]; then
+              echo "::error::Unexpected versionCode in $APK: $CODE (expected $EXPECTED_VERSION_CODE)"
+              exit 1
+            fi
+
+            if [[ "$NAME" != "$EXPECTED_VERSION_NAME" ]]; then
+              echo "::error::Unexpected versionName in $APK (expected $EXPECTED_VERSION_NAME)"
+              exit 1
+            fi
+
+            "$APKSIGNER" verify --verbose "$APK"
+
+            CERT_OUTPUT=$("$APKSIGNER" verify --print-certs "$APK" 2>&1)
+
+            printf '%s\n' "$CERT_OUTPUT"
+
+            ACTUAL_CERT=$(
+              printf '%s\n' "$CERT_OUTPUT" \
+                | sed -nE 's/.*certificate SHA-256 digest:[[:space:]]*//Ip' \
+                | head -n 1 \
+                | tr -d ':\r[:space:]' \
+                | tr '[:lower:]' '[:upper:]'
+            )
+
+            if [[ -z "$ACTUAL_CERT" ]]; then
+              echo "::error::Could not read certificate fingerprint from APK: $APK"
+              exit 1
+            fi
+
+            if [[ "$ACTUAL_CERT" != "$EXPECTED_CERT" ]]; then
+              echo "::error::APK signing certificate does not match the configured keystore: $APK"
+              exit 1
+            fi
+
+            echo "Signature verified: $APK"
+          done
+
+          echo "Verified ${#APK_FILES[@]} APK file(s)."
+
+      # 21. 上传构建产物
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bettbox-Android-ARM64-${{ inputs.release_tag }}
+          path: upstream/dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # 22. 保存 versionCode 到默认分支
+      - name: Save allocated versionCode
+        working-directory: custom-files
+        shell: bash
+        env:
+          NEW_VERSION_CODE: ${{ steps.app-version.outputs.version_code }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          FILE="starry/txt/versioncode.txt"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          printf '%s\n' "$NEW_VERSION_CODE" > "$FILE"
+
+          git add "$FILE"
+
+          if git diff --cached --quiet; then
+            echo "::error::Counter file did not change"
+            exit 1
+          fi
+
+          git commit -m "chore: update versionCode to $NEW_VERSION_CODE"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+
+      # 23. 创建 GitHub Release
+      - name: Publish GitHub Release
+        working-directory: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TITLE: ${{ inputs.release_tag }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+
+          ARGS=(
+            "$RELEASE_TAG"
+            dist/*.apk
+            --repo "$GITHUB_REPOSITORY"
+            --title "$RELEASE_TITLE"
+            --generate-notes
+          )
+
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            ARGS+=(--prerelease)
+          fi
+
+          gh release create "${ARGS[@]}"
