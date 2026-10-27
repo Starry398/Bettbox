@@ -1,7 +1,8 @@
 diff --git a/lib/common/constant.dart b/lib/common/constant.dart
 --- a/lib/common/constant.dart
 +++ b/lib/common/constant.dart
-@@ -45,6 +45,7 @@ const customDashboardTitleKey = 'custom_dashboard_title';
+@@ -45,6 +45,7 @@
+ const customDashboardTitleKey = 'custom_dashboard_title';
  const double dialogCommonWidth = 300;
  const repository = 'appshubcc/Bettbox';
 +const forkRepository = 'Starry398/Bettbox';
@@ -11,8 +12,8 @@ diff --git a/lib/common/constant.dart b/lib/common/constant.dart
 diff --git a/lib/common/request.dart b/lib/common/request.dart
 --- a/lib/common/request.dart
 +++ b/lib/common/request.dart
-@@ -13,6 +13,15 @@ import 'package:cupertino_ui/cupertino_ui.dart';
-
+@@ -13,4 +13,13 @@
+ 
 +class _UpdateVersion {
 +  final int major;
 +  final int minor;
@@ -25,7 +26,7 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
  class Request {
    late final Dio _dio;
    late final Dio _clashDio;
-@@ -254,35 +263,83 @@ class Request {
+@@ -254,39 +263,95 @@ class Request {
 -  Future<Map<String, dynamic>?> checkForUpdate() async {
 +  Future<Map<String, dynamic>?> checkForUpdate({
 +    String repo = repository,
@@ -109,7 +110,7 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
      }
      return null;
    }
-
+ 
 +  _UpdateVersion? _parseUpdateVersion(String raw) {
 +    var value = raw.trim();
 +    if (value.startsWith('v')) value = value.substring(1);
@@ -151,16 +152,16 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 diff --git a/lib/controller.dart b/lib/controller.dart
 --- a/lib/controller.dart
 +++ b/lib/controller.dart
-@@ -1174,9 +1174,9 @@
+@@ -1174,6 +1174,6 @@
 -    final res = await request.checkForUpdate();
 +    final res = await request.checkForUpdate(repo: forkRepository);
      if (res != null) {
 -      checkUpdateResultHandle(data: res);
 +      checkUpdateResultHandle(data: res, repo: forkRepository);
      }
-
+ 
      await prefs?.setInt('last_check_update_time', now);
-@@ -1184,11 +1184,10 @@
+@@ -1184,10 +1184,8 @@
    Future<void> checkUpdateResultHandle({
      Map<String, dynamic>? data,
      bool handleError = false,
@@ -172,38 +173,35 @@ diff --git a/lib/controller.dart b/lib/controller.dart
      if (data != null) {
        final tagName = data['tag_name'];
        final body = data['body'];
-@@ -1209,7 +1208,7 @@
+@@ -1209,3 +1208,3 @@
        }
        const String assetSuffix = String.fromEnvironment('APP_ASSET_SUFFIX');
 -      String downloadUrl = 'https://github.com/$repository/releases/latest';
 +      String downloadUrl = 'https://github.com/$repo/releases/latest';
-
-       if (assetSuffix.isNotEmpty) {
-         final versionWithoutV = tagName.startsWith('v')
-@@ -1220,7 +1219,7 @@
+@@ -1220,6 +1219,6 @@
            finalSuffix = 'windows-amd64-compatible-portable.zip';
          }
          downloadUrl =
 -            'https://github.com/$repository/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
 +            'https://github.com/$repo/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
-
+ 
        globalState.openUrl(downloadUrl);
 diff --git a/lib/views/about.dart b/lib/views/about.dart
 --- a/lib/views/about.dart
 +++ b/lib/views/about.dart
-@@ -25,7 +25,7 @@
+@@ -25,4 +25,4 @@
 -      request.checkForUpdate,
 +      () => request.checkForUpdate(repo: forkRepository),
        title: appLocalizations.checkUpdate,
        needLoading: true,
      );
-@@ -34,6 +34,7 @@
+@@ -34,4 +34,5 @@
      globalState.appController.checkUpdateResultHandle(
        data: data,
        handleError: true,
 +      repo: forkRepository,
      );
-@@ -64,6 +65,14 @@
+@@ -64,6 +65,16 @@
          prefix: 'Powered by',
          title: 'Mihomo',
          icon: Icons.memory,
