@@ -62,7 +62,7 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 -            'body': 'New version available. Please visit GitHub to download.',
 -          };
 -        }
-+
++ 
 +      final releases = response.data;
 +      if (releases == null || releases.isEmpty) return null;
 +
@@ -164,7 +164,7 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 @@ -1000,2 +1080,20 @@ class Request {
    }
  }
-+
+
 +class _UpdateVersion {
 +  final int major;
 +  final int minor;
@@ -216,7 +216,6 @@ diff --git a/lib/controller.dart b/lib/controller.dart
          downloadUrl =
 -            'https://github.com/$repository/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
 +            'https://github.com/$repo/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
-       }
 
        globalState.openUrl(downloadUrl);
 diff --git a/lib/views/about.dart b/lib/views/about.dart
