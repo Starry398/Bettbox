@@ -1,5 +1,12 @@
 name: Check
 
+# Validates that the patches in starry/patch still apply to the upstream
+# release that Pre/Sync would actually build, hunk by hunk, without building
+# anything. Two properties matter here:
+#   1. it checks the release tag, not the branch, so it validates the same tree
+#      the build will use;
+#   2. it verifies each hunk's declared line count, so a hand-written patch that
+#      is off by one fails with the hunk's line number instead of "corrupt patch".
 on:
   workflow_dispatch:
 
@@ -21,85 +28,141 @@ concurrency:
 jobs:
   check:
     name: Check Patch Applicability
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout Upstream Bettbox
+      - name: Resolve upstream tag
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG=$(gh api repos/appshubcc/Bettbox/releases/latest --jq '.tag_name')
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream tag: $TAG"
+            exit 1
+          fi
+
+          echo "Upstream stable tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream release source
         uses: actions/checkout@v4
         with:
           repository: appshubcc/Bettbox
+          ref: ${{ steps.upstream.outputs.tag }}
           fetch-depth: 1
+          submodules: false
           path: upstream
 
-      - name: Checkout Custom Patch Files
+      - name: Checkout custom files
         uses: actions/checkout@v4
         with:
-          repository: Starry398/Bettbox
-          ref: ${{ github.ref }}
-          fetch-depth: 1
+          path: custom-files
           sparse-checkout: |
             starry/patch
-          path: custom
+          sparse-checkout-cone-mode: false
 
-      - name: Validate Patch Directory
+      - name: Validate patches
+        working-directory: upstream
         shell: bash
         run: |
           set -euo pipefail
 
-          PATCH_DIR="custom/starry/patch"
+          PATCH_DIR="../custom-files/starry/patch"
 
-          if [ ! -d "$PATCH_DIR" ]; then
+          test -d "$PATCH_DIR" || {
             echo "::error::Patch directory not found: $PATCH_DIR"
             exit 1
-          fi
+          }
 
-          mapfile -t PATCHES < <(
-            find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' \
-              -printf '%f\n' | sort
-          )
+          shopt -s nullglob
+          PATCHES=("$PATCH_DIR"/*.patch)
 
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
+          if (( ${#PATCHES[@]} == 0 )); then
             echo "::error::No .patch files found in $PATCH_DIR"
             exit 1
           fi
 
-          echo "Found ${#PATCHES[@]} patch file(s):"
-          printf ' - %s\n' "${PATCHES[@]}"
+          for patch in "${PATCHES[@]}"; do
+            echo "::group::$(basename "$patch")"
 
-      - name: Check Patch Applicability
-        shell: bash
-        run: |
-          set -euo pipefail
+            python3 - "$patch" <<'PY'
+          import pathlib
+          import re
+          import sys
 
-          PATCH_DIR="$GITHUB_WORKSPACE/custom/starry/patch"
-          UPSTREAM_DIR="$GITHUB_WORKSPACE/upstream"
+          path = pathlib.Path(sys.argv[1])
+          raw = path.read_text()
 
-          mapfile -t PATCHES < <(
-            find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' \
-              -printf '%f\n' | sort
-          )
+          # A patch has to end with exactly one newline; editors drop it or
+          # leave a blank line behind, and git then reports "corrupt patch".
+          fixed = raw.rstrip("\n") + "\n"
+          if fixed != raw:
+              path.write_text(fixed)
+              print(f"normalised trailing newlines: {path.name}")
+              raw = fixed
 
-          cd "$UPSTREAM_DIR"
+          lines = raw.split("\n")
+          if lines and lines[-1] == "":
+              lines = lines[:-1]
 
-          for PATCH_NAME in "${PATCHES[@]}"; do
-            PATCH_FILE="$PATCH_DIR/$PATCH_NAME"
+          current = None
+          index = 0
+          bad = 0
+          print(f"{len(lines)} lines")
 
-            echo ""
-            echo "========================================"
-            echo "Checking: $PATCH_NAME"
-            echo "========================================"
+          while index < len(lines):
+              line = lines[index]
+              if line.startswith("diff --git "):
+                  current = line.split(" b/")[-1]
+                  print(f"  file: {current}")
+              header = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+              if header:
+                  old_expected = int(header.group(2) or 1)
+                  new_expected = int(header.group(4) or 1)
+                  index += 1
+                  old_seen = new_seen = 0
+                  while index < len(lines):
+                      body = lines[index]
+                      if body.startswith("@@") or body.startswith("diff --git "):
+                          break
+                      if body.startswith(" ") or body == "":
+                          old_seen += 1
+                          new_seen += 1
+                      elif body.startswith("-"):
+                          old_seen += 1
+                      elif body.startswith("+"):
+                          new_seen += 1
+                      index += 1
+                  if old_seen != old_expected or new_seen != new_expected:
+                      print(
+                          f"  ! hunk at line {index}: declared "
+                          f"-{old_expected} +{new_expected}, found "
+                          f"-{old_seen} +{new_seen}"
+                      )
+                      bad += 1
+                  continue
+              index += 1
 
-            if git apply --check "$PATCH_FILE"; then
-              echo "PASS: $PATCH_NAME can be applied."
-            else
-              echo "::error title=Patch check failed::$PATCH_NAME cannot be applied to the current upstream source."
+          if bad:
+              print(f"  {bad} malformed hunk(s)")
+              sys.exit(1)
+          print("  all hunks match their declared counts")
+          PY
+
+            echo "Checking against the upstream tree"
+            git apply --check "$patch" || {
+              echo "::error::Patch cannot be applied: $(basename "$patch")"
               exit 1
-            fi
+            }
 
-            git apply "$PATCH_FILE"
+            git apply --stat "$patch"
+            git apply "$patch"
+            echo "::endgroup::"
           done
 
-          echo ""
-          echo "========================================"
-          echo "All patches can be applied successfully."
-          echo "========================================"
+          echo "All ${#PATCHES[@]} patch(es) apply cleanly."
