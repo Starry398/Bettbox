@@ -1,7 +1,8 @@
 diff --git a/lib/common/constant.dart b/lib/common/constant.dart
+index dcfff98..0a69b1f 100644
 --- a/lib/common/constant.dart
 +++ b/lib/common/constant.dart
-@@ -45,6 +45,7 @@
+@@ -44,6 +44,7 @@ const customSidebarIconKey = 'custom_sidebar_icon';
  const customDashboardTitleKey = 'custom_dashboard_title';
  const double dialogCommonWidth = 300;
  const repository = 'appshubcc/Bettbox';
@@ -10,9 +11,12 @@ diff --git a/lib/common/constant.dart b/lib/common/constant.dart
  const defaultExternalController = '127.0.0.1:9090';
  const maxMobileWidth = 600;
 diff --git a/lib/common/request.dart b/lib/common/request.dart
+index 3200272..5dcb817 100644
 --- a/lib/common/request.dart
 +++ b/lib/common/request.dart
-@@ -13,4 +13,13 @@
+@@ -11,6 +11,17 @@ import 'package:bett_box/models/models.dart';
+ import 'package:bett_box/state.dart';
+ import 'package:cupertino_ui/cupertino_ui.dart';
  
 +class _UpdateVersion {
 +  final int major;
@@ -21,12 +25,17 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 +  final int? pre;
 +
 +  const _UpdateVersion(this.major, this.minor, this.patch, this.pre);
++
++  bool get isPreRelease => pre != null;
 +}
 +
  class Request {
    late final Dio _dio;
    late final Dio _clashDio;
-@@ -254,39 +263,95 @@ class Request {
+@@ -254,42 +265,101 @@ class Request {
+     return MemoryImage(bytes);
+   }
+ 
 -  Future<Map<String, dynamic>?> checkForUpdate() async {
 +  Future<Map<String, dynamic>?> checkForUpdate({
 +    String repo = repository,
@@ -35,20 +44,18 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 -      final t = DateTime.now().millisecondsSinceEpoch;
 -      final response = await _dio.get(
 -        'https://github.com/$repository/releases/latest?t=$t',
--        options: Options(
--          followRedirects: false,
--          validateStatus: (status) =>
--              status != null && status >= 300 && status < 400,
--        ),
 +      final current = _parseUpdateVersion(globalState.packageInfo.version);
 +      if (current == null) return null;
 +
 +      final response = await _dio.get<List<dynamic>>(
 +        'https://api.github.com/repos/$repo/releases',
 +        queryParameters: {'per_page': 100, 'page': 1},
-+        options: Options(
+         options: Options(
+-          followRedirects: false,
+-          validateStatus: (status) =>
+-              status != null && status >= 300 && status < 400,
 +          headers: {'Accept': 'application/vnd.github+json'},
-+        ),
+         ),
        );
 -      final location = response.headers['location']?.firstOrNull;
 -      if (location != null && location.contains('/releases/tag/')) {
@@ -67,7 +74,6 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 -            'html_url': 'https://github.com/$repository/releases/latest',
 -            'body': 'New version available. Please visit GitHub to download.',
 -          };
--        }
 +
 +      final candidates = <Map<String, dynamic>>[];
 +      for (final item in response.data ?? <dynamic>[]) {
@@ -79,15 +85,14 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 +        if (version == null) continue;
 +
 +        final core = _compareCore(version, current);
++        // 稳定版忽略预发布版；预发布版只在同核心号时忽略正式版
 +        if (!current.isPreRelease && version.isPreRelease) continue;
-+        if (current.isPreRelease &&
-+            !version.isPreRelease &&
-+            core == 0) {
++        if (current.isPreRelease && !version.isPreRelease && core == 0) {
 +          continue;
 +        }
 +        if (_compareUpdateVersion(version, current) > 0) {
 +          candidates.add(item);
-+        }
+         }
        }
 +
 +      if (candidates.isEmpty) return null;
@@ -100,9 +105,10 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 +      final latest = candidates.first;
 +      return {
 +        'tag_name': latest['tag_name'],
-+        'html_url': latest['html_url'] ??
-+            'https://github.com/$repo/releases',
-+        'body': latest['body'] ??
++        'html_url':
++            latest['html_url'] ?? 'https://github.com/$repo/releases',
++        'body':
++            latest['body'] ??
 +            'New version available. Please visit GitHub to download.',
 +      };
      } catch (e) {
@@ -113,17 +119,20 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
  
 +  _UpdateVersion? _parseUpdateVersion(String raw) {
 +    var value = raw.trim();
-+    if (value.startsWith('v')) value = value.substring(1);
++    if (value.startsWith('v') || value.startsWith('V')) {
++      value = value.substring(1);
++    }
 +    final match = RegExp(
-+      r'^(\d+)\.(\d+)\.(\d+)(?:-pre\.?(\d+))?$',
++      r'^(\d+)\.(\d+)\.(\d+)(?:-(?:pre|beta|rc)\.?(\d*))?$',
 +      caseSensitive: false,
 +    ).firstMatch(value);
 +    if (match == null) return null;
++    final pre = match.group(4);
 +    return _UpdateVersion(
 +      int.parse(match.group(1)!),
 +      int.parse(match.group(2)!),
 +      int.parse(match.group(3)!),
-+      match.group(4) == null ? null : int.parse(match.group(4)!),
++      pre == null || pre.isEmpty ? null : int.parse(pre),
 +    );
 +  }
 +
@@ -150,9 +159,13 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
      final locale = Intl.getCurrentLocale().toLowerCase();
      final isZh = locale.startsWith('zh');
 diff --git a/lib/controller.dart b/lib/controller.dart
+index 566230f..6d11636 100644
 --- a/lib/controller.dart
 +++ b/lib/controller.dart
-@@ -1174,6 +1174,6 @@
+@@ -1172,9 +1172,9 @@ class AppController {
+ 
+     if (!isAutoCheck && !forceCheck) return;
+ 
 -    final res = await request.checkForUpdate();
 +    final res = await request.checkForUpdate(repo: forkRepository);
      if (res != null) {
@@ -161,7 +174,7 @@ diff --git a/lib/controller.dart b/lib/controller.dart
      }
  
      await prefs?.setInt('last_check_update_time', now);
-@@ -1184,10 +1184,8 @@
+@@ -1183,10 +1183,8 @@ class AppController {
    Future<void> checkUpdateResultHandle({
      Map<String, dynamic>? data,
      bool handleError = false,
@@ -173,48 +186,58 @@ diff --git a/lib/controller.dart b/lib/controller.dart
      if (data != null) {
        final tagName = data['tag_name'];
        final body = data['body'];
-@@ -1209,3 +1208,3 @@
+@@ -1209,7 +1207,7 @@ class AppController {
+         return;
        }
        const String assetSuffix = String.fromEnvironment('APP_ASSET_SUFFIX');
 -      String downloadUrl = 'https://github.com/$repository/releases/latest';
 +      String downloadUrl = 'https://github.com/$repo/releases/latest';
-@@ -1220,6 +1219,6 @@
+ 
+       if (assetSuffix.isNotEmpty) {
+         final versionWithoutV = tagName.startsWith('v')
+@@ -1220,7 +1218,7 @@ class AppController {
            finalSuffix = 'windows-amd64-compatible-portable.zip';
          }
          downloadUrl =
 -            'https://github.com/$repository/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
 +            'https://github.com/$repo/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
+       }
  
        globalState.openUrl(downloadUrl);
 diff --git a/lib/views/about.dart b/lib/views/about.dart
+index 1ac6738..3928404 100644
 --- a/lib/views/about.dart
 +++ b/lib/views/about.dart
-@@ -25,4 +25,4 @@
+@@ -23,13 +23,14 @@ class AboutView extends StatelessWidget {
+     final commonScaffoldState = context.commonScaffoldState;
+     if (commonScaffoldState?.mounted != true) return;
+     final data = await globalState.appController.safeRun<Map<String, dynamic>?>(
 -      request.checkForUpdate,
 +      () => request.checkForUpdate(repo: forkRepository),
        title: appLocalizations.checkUpdate,
        needLoading: true,
      );
-@@ -34,4 +34,5 @@
      globalState.appController.checkUpdateResultHandle(
        data: data,
        handleError: true,
 +      repo: forkRepository,
      );
-@@ -64,6 +65,16 @@
-         prefix: 'Powered by',
-         title: 'Mihomo',
+   }
+ 
+@@ -70,6 +71,16 @@ class AboutView extends StatelessWidget {
          icon: Icons.memory,
          onTap: () => globalState.openUrl('https://github.com/MetaCubeX/mihomo'),
        ),
 +      _LinkTile(
 +        title: '我的 GitHub 仓库',
-+        icon: Icons.code,
++        icon: Icons.person_outline,
 +        onTap: () => globalState.openUrl('https://github.com/$forkRepository'),
 +      ),
 +      _LinkTile(
 +        title: '上游 GitHub 仓库',
-+        icon: Icons.code,
++        icon: Icons.call_split_sharp,
 +        onTap: () => globalState.openUrl('https://github.com/$repository'),
 +      ),
      ];
+     return generateSection(
+       title: appLocalizations.more,
