@@ -82,6 +82,12 @@ jobs:
           echo "Next version: $VERSION_NAME"
           echo "Release tag: $RELEASE_TAG"
 
+          if gh release view "$RELEASE_TAG" \
+            --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+
           echo "source_tag=$SOURCE_TAG" >> "$GITHUB_OUTPUT"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
