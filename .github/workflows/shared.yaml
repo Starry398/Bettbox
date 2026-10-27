@@ -1,4 +1,3 @@
-
 name: Shared
 
 on:
@@ -56,7 +55,28 @@ jobs:
           echo "Default branch: $BRANCH"
           echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      # 2. 获取上游指定版本源码
+      # 2. 确认 release tag 未被占用，避免构建完才失败
+      - name: Check release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo "::error::Release tag must not be empty"
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+
+      # 3. 获取上游指定版本源码
       - name: Checkout upstream release source
         uses: actions/checkout@v4
         with:
@@ -66,7 +86,7 @@ jobs:
           submodules: recursive
           path: upstream
 
-      # 3. 获取自己的自定义资源、补丁和版本计数器
+      # 4. 获取自己的自定义资源、补丁和版本计数器
       - name: Checkout custom files
         uses: actions/checkout@v4
         with:
@@ -81,7 +101,7 @@ jobs:
             starry/txt/versioncode.txt
           sparse-checkout-cone-mode: false
 
-      # 4. 覆盖自定义 XML 资源
+      # 5. 覆盖自定义 XML 资源
       - name: Restore custom XML resources
         working-directory: upstream
         shell: bash
@@ -120,7 +140,7 @@ jobs:
 
           echo "Restored $XML_COUNT custom XML file(s)."
 
-      # 5. 只复制自定义应用图标，不再复制头像
+      # 6. 只复制自定义应用图标，不再复制头像
       - name: Restore custom images
         working-directory: upstream
         shell: bash
@@ -147,7 +167,7 @@ jobs:
           # 不再要求 avatars 目录存在，也不复制任何自定义头像
           echo "Skipping custom avatars."
 
-      # 6. 应用自定义补丁
+      # 7. 应用自定义补丁
       - name: Apply custom patches
         working-directory: upstream
         shell: bash
@@ -168,6 +188,21 @@ jobs:
             echo "No .patch files found. Skipping custom patches."
           else
             for patch in "${PATCHES[@]}"; do
+              # A patch must end with exactly one newline. Editors drop the
+              # last one or leave a blank line behind, and git then reports
+              # "corrupt patch" on the final line.
+              python3 - "$patch" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          raw = path.read_text()
+          fixed = raw.rstrip("\n") + "\n"
+          if fixed != raw:
+              path.write_text(fixed)
+              print(f"normalised trailing newlines: {path.name}")
+          PY
+
               echo "Checking patch: $(basename "$patch")"
 
               if ! git apply --check "$patch"; then
@@ -183,7 +218,7 @@ jobs:
             echo "Applied ${#PATCHES[@]} custom patch(es)."
           fi
 
-      # 7. 读取上游工具链版本
+      # 8. 读取上游工具链版本
       - name: Read upstream toolchain versions
         id: toolchain
         working-directory: upstream
@@ -225,7 +260,7 @@ jobs:
           echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
           echo "ndk_version=$NDK_VERSION" >> "$GITHUB_OUTPUT"
 
-      # 8. 校验版本并分配 versionCode
+      # 9. 校验版本并分配 versionCode
       - name: Allocate next versionCode
         id: app-version
         working-directory: upstream
@@ -318,7 +353,7 @@ jobs:
           echo "EXPECTED_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
           echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
 
-      # 9. 修改应用包名
+      # 10. 修改应用包名
       - name: Set custom application ID
         working-directory: upstream
         shell: bash
@@ -338,13 +373,13 @@ jobs:
 
           grep -F 'applicationId =' "$FILE"
 
-      # 10. 配置 Rust
+      # 11. 配置 Rust
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
-      # 11. 配置 Java
+      # 12. 配置 Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -352,7 +387,7 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      # 12. 安装上游要求的 Android NDK
+      # 13. 安装上游要求的 Android NDK
       - name: Setup Android NDK
         shell: bash
         env:
@@ -374,7 +409,7 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
           echo "Using Android NDK: $NDK_PATH"
 
-      # 13. 配置 Cargo Android linker
+      # 14. 配置 Cargo Android linker
       - name: Configure Cargo for Android
         shell: bash
         run: |
@@ -389,14 +424,14 @@ jobs:
 
           cat ~/.cargo/config.toml
 
-      # 14. 配置 Go
+      # 15. 配置 Go
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache-dependency-path: upstream/core/go.sum
 
-      # 15. 配置 Flutter
+      # 16. 配置 Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -404,12 +439,12 @@ jobs:
           flutter-version: ${{ steps.toolchain.outputs.flutter_version }}
           cache: true
 
-      # 16. 清理 Pub 凭据
+      # 17. 清理 Pub 凭据
       - name: Clear Pub Cache Credentials
         shell: bash
         run: rm -f ~/.pub-cache/credentials.json || true
 
-      # 17. 配置 Android 签名
+      # 18. 配置 Android 签名
       - name: Setup Android signing
         working-directory: upstream
         shell: bash
@@ -442,26 +477,27 @@ jobs:
             -storepass "$STORE_PASSWORD" \
             -alias "$KEY_ALIAS" >/dev/null
 
-      # 18. 清理旧构建
+      # 19. 清理旧构建
       - name: Clean Android build
         working-directory: upstream
         shell: bash
         run: flutter clean
 
-      # 19. 构建 ARM64 APK
+      # 20. 构建 ARM64 APK
       - name: Build Bettbox Android ARM64
         working-directory: upstream
         shell: bash
         env:
           SENTRY_DSN: ''
+          APP_ENV_ARG: ${{ inputs.prerelease == true && 'pre' || 'stable' }}
         run: |
           set -euo pipefail
 
           flutter pub get
           dart run build_runner build
-          dart setup.dart android --arch arm64 --env stable
+          dart setup.dart android --arch arm64 --env "$APP_ENV_ARG"
 
-      # 20. 验证 APK 版本和签名
+      # 21. 验证 APK 版本和签名
       - name: Verify APK version and signature
         working-directory: upstream
         shell: bash
@@ -570,7 +606,30 @@ jobs:
 
           echo "Verified ${#APK_FILES[@]} APK file(s)."
 
-      # 21. 上传构建产物
+      # 22. 固定产物文件名，保证应用内更新直链不会因命名漂移而 404
+      - name: Rename APK
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          APK_FILES=(dist/*.apk)
+
+          if (( ${#APK_FILES[@]} != 1 )); then
+            echo "::error::Expected exactly one APK before renaming"
+            exit 1
+          fi
+
+          DEST="dist/Bettbox-${EXPECTED_VERSION_NAME}-android-arm64-v8a.apk"
+
+          if [[ "${APK_FILES[0]}" != "$DEST" ]]; then
+            mv -f "${APK_FILES[0]}" "$DEST"
+          fi
+
+          echo "Final APK: $DEST"
+
+      # 23. 上传构建产物
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -579,7 +638,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 22. 保存 versionCode 到默认分支
+      # 24. 保存 versionCode 到默认分支
       - name: Save allocated versionCode
         working-directory: custom-files
         shell: bash
@@ -606,7 +665,7 @@ jobs:
           git commit -m "chore: update versionCode to $NEW_VERSION_CODE"
           git push origin "HEAD:${DEFAULT_BRANCH}"
 
-      # 23. 创建 GitHub Release
+      # 25. 创建 GitHub Release
       - name: Publish GitHub Release
         working-directory: upstream
         env:
