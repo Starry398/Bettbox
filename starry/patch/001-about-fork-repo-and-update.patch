@@ -11,49 +11,42 @@ index dcfff98..0a69b1f 100644
  const defaultExternalController = '127.0.0.1:9090';
  const maxMobileWidth = 600;
 diff --git a/lib/common/request.dart b/lib/common/request.dart
-index 3200272..5dcb817 100644
+index 3200272..6a1b1bc 100644
 --- a/lib/common/request.dart
 +++ b/lib/common/request.dart
-@@ -11,6 +11,17 @@ import 'package:bett_box/models/models.dart';
- import 'package:bett_box/state.dart';
- import 'package:cupertino_ui/cupertino_ui.dart';
- 
-+class _UpdateVersion {
-+  final int major;
-+  final int minor;
-+  final int patch;
-+  final int? pre;
-+
-+  const _UpdateVersion(this.major, this.minor, this.patch, this.pre);
-+
-+  bool get isPreRelease => pre != null;
-+}
-+
- class Request {
-   late final Dio _dio;
-   late final Dio _clashDio;
-@@ -254,42 +265,101 @@ class Request {
+@@ -254,40 +254,57 @@ class Request {
      return MemoryImage(bytes);
    }
  
 -  Future<Map<String, dynamic>?> checkForUpdate() async {
++  /// 与 FlClash 同一套逻辑：先问 API 拿完整 release，再比版本。
++  /// 返回 null 表示已是最新；请求失败时抛异常，由调用方提示。
 +  Future<Map<String, dynamic>?> checkForUpdate({
++    String repo = repository,
++  }) async {
++    final release = await latestRelease(repo: repo);
++    final remoteVersion = release['tag_name']?.toString() ?? '';
++    final version = globalState.packageInfo.version;
++    final hasUpdate =
++        utils.compareVersions(remoteVersion.replaceAll('v', ''), version) > 0;
++    return hasUpdate ? release : null;
++  }
++
++  /// The release page redirect still answers once the hourly API quota is spent.
++  Future<Map<String, dynamic>> latestRelease({
 +    String repo = repository,
 +  }) async {
      try {
 -      final t = DateTime.now().millisecondsSinceEpoch;
 -      final response = await _dio.get(
 -        'https://github.com/$repository/releases/latest?t=$t',
-+      final current = _parseUpdateVersion(globalState.packageInfo.version);
-+      if (current == null) return null;
-+
-+      final response = await _dio.get<List<dynamic>>(
-+        'https://api.github.com/repos/$repo/releases',
-+        queryParameters: {'per_page': 100, 'page': 1},
++      final response = await _dio.get<Map<String, dynamic>>(
++        'https://api.github.com/repos/$repo/releases/latest',
          options: Options(
 -          followRedirects: false,
 -          validateStatus: (status) =>
 -              status != null && status >= 300 && status < 400,
++          responseType: ResponseType.json,
 +          headers: {'Accept': 'application/vnd.github+json'},
          ),
        );
@@ -74,107 +67,152 @@ index 3200272..5dcb817 100644
 -            'html_url': 'https://github.com/$repository/releases/latest',
 -            'body': 'New version available. Please visit GitHub to download.',
 -          };
-+
-+      final candidates = <Map<String, dynamic>>[];
-+      for (final item in response.data ?? <dynamic>[]) {
-+        if (item is! Map<String, dynamic> || item['draft'] == true) {
-+          continue;
-+        }
-+        final tag = item['tag_name']?.toString() ?? '';
-+        final version = _parseUpdateVersion(tag);
-+        if (version == null) continue;
-+
-+        final core = _compareCore(version, current);
-+        // 稳定版忽略预发布版；预发布版只在同核心号时忽略正式版
-+        if (!current.isPreRelease && version.isPreRelease) continue;
-+        if (current.isPreRelease && !version.isPreRelease && core == 0) {
-+          continue;
-+        }
-+        if (_compareUpdateVersion(version, current) > 0) {
-+          candidates.add(item);
-         }
+-        }
++      final data = response.data;
++      if (data != null && (data['tag_name']?.toString().isNotEmpty ?? false)) {
++        return data;
        }
-+
-+      if (candidates.isEmpty) return null;
-+      candidates.sort((a, b) {
-+        final av = _parseUpdateVersion(a['tag_name'].toString())!;
-+        final bv = _parseUpdateVersion(b['tag_name'].toString())!;
-+        return _compareUpdateVersion(bv, av);
-+      });
-+
-+      final latest = candidates.first;
-+      return {
-+        'tag_name': latest['tag_name'],
-+        'html_url':
-+            latest['html_url'] ?? 'https://github.com/$repo/releases',
-+        'body':
-+            latest['body'] ??
-+            'New version available. Please visit GitHub to download.',
-+      };
-     } catch (e) {
-       commonPrint.warn('Check update failed: ${e.formatErrorLog}');
+-    } catch (e) {
+-      commonPrint.warn('Check update failed: ${e.formatErrorLog}');
++    } on Object catch (e) {
++      commonPrint.warn('Latest release API failed: ${e.formatErrorLog}');
++    }
++    final response = await _dio.get<void>(
++      'https://github.com/$repo/releases/latest',
++      options: Options(
++        followRedirects: false,
++        validateStatus: (status) =>
++            status != null && status >= 300 && status < 400,
++      ),
++    );
++    final location = response.headers['location']?.firstOrNull;
++    final segments = Uri.tryParse(location ?? '')?.pathSegments ?? const [];
++    final tagIndex = segments.indexOf('tag') + 1;
++    if (tagIndex == 0 || tagIndex >= segments.length) {
++      throw FormatException('No release tag in the redirect', location);
      }
-     return null;
+-    return null;
++    final tag = segments[tagIndex];
++    return {
++      'tag_name': tag,
++      'html_url': 'https://github.com/$repo/releases/tag/$tag',
++    };
    }
  
-+  _UpdateVersion? _parseUpdateVersion(String raw) {
-+    var value = raw.trim();
-+    if (value.startsWith('v') || value.startsWith('V')) {
-+      value = value.substring(1);
-+    }
-+    final match = RegExp(
-+      r'^(\d+)\.(\d+)\.(\d+)(?:-(?:pre|beta|rc)\.?(\d*))?$',
-+      caseSensitive: false,
-+    ).firstMatch(value);
-+    if (match == null) return null;
-+    final pre = match.group(4);
-+    return _UpdateVersion(
-+      int.parse(match.group(1)!),
-+      int.parse(match.group(2)!),
-+      int.parse(match.group(3)!),
-+      pre == null || pre.isEmpty ? null : int.parse(pre),
-+    );
-+  }
-+
-+  int _compareCore(_UpdateVersion a, _UpdateVersion b) {
+   List<String> _getPrimaryIpSources() {
+diff --git a/lib/common/utils.dart b/lib/common/utils.dart
+index b99c2ea..23800a8 100644
+--- a/lib/common/utils.dart
++++ b/lib/common/utils.dart
+@@ -771,27 +771,25 @@ class Utils {
+     return brightness == Brightness.dark ? darkPath : lightPath;
+   }
+ 
++  /// 支持 `1.2.3` / `v1.2.3` / `1.2.3-pre.1` / `1.2.3+build` 这几种写法。
++  /// 同号预发布版低于正式版：`1.2.3-pre.1` < `1.2.3`。
+   int compareVersions(String version1, String version2) {
+-    List<String> v1 = version1.split('+')[0].split('.');
+-    List<String> v2 = version2.split('+')[0].split('.');
+-    int major1 = int.parse(v1[0]);
+-    int major2 = int.parse(v2[0]);
+-    if (major1 != major2) {
+-      return major1.compareTo(major2);
++    final a = _SemVer.parse(version1);
++    final b = _SemVer.parse(version2);
 +    final major = a.major.compareTo(b.major);
 +    if (major != 0) return major;
 +    final minor = a.minor.compareTo(b.minor);
 +    if (minor != 0) return minor;
-+    return a.patch.compareTo(b.patch);
-+  }
-+
-+  int _compareUpdateVersion(_UpdateVersion a, _UpdateVersion b) {
-+    final core = _compareCore(a, b);
-+    if (core != 0) return core;
++    final patch = a.patch.compareTo(b.patch);
++    if (patch != 0) return patch;
 +    if (a.pre != null && b.pre != null) {
-+      return a.pre!.compareTo(b.pre!);
-+    }
++      final pre = a.pre!.compareTo(b.pre!);
++      if (pre != 0) return pre;
++      return a.build.compareTo(b.build);
+     }
+-    int minor1 = v1.length > 1 ? int.parse(v1[1]) : 0;
+-    int minor2 = v2.length > 1 ? int.parse(v2[1]) : 0;
+-    if (minor1 != minor2) {
+-      return minor1.compareTo(minor2);
+-    }
+-    int patch1 = v1.length > 2 ? int.parse(v1[2]) : 0;
+-    int patch2 = v2.length > 2 ? int.parse(v2[2]) : 0;
+-    if (patch1 != patch2) {
+-      return patch1.compareTo(patch2);
+-    }
+-    int build1 = version1.contains('+') ? int.parse(version1.split('+')[1]) : 0;
+-    int build2 = version2.contains('+') ? int.parse(version2.split('+')[1]) : 0;
+-    return build1.compareTo(build2);
 +    if (a.pre != null) return -1;
 +    if (b.pre != null) return 1;
-+    return 0;
-+  }
++    return a.build.compareTo(b.build);
+   }
+ 
+   final Map<String, String> _pinyinCache = {};
+@@ -1289,3 +1287,40 @@ class Utils {
+ }
+ 
+ final utils = Utils();
 +
-   List<String> _getPrimaryIpSources() {
-     final locale = Intl.getCurrentLocale().toLowerCase();
-     final isZh = locale.startsWith('zh');
++class _SemVer {
++  final int major;
++  final int minor;
++  final int patch;
++  final int? pre;
++  final int build;
++
++  const _SemVer(this.major, this.minor, this.patch, this.pre, this.build);
++
++  static _SemVer parse(String raw) {
++    var value = raw.trim();
++    if (value.startsWith('v') || value.startsWith('V')) {
++      value = value.substring(1);
++    }
++    var build = 0;
++    final buildIndex = value.indexOf('+');
++    if (buildIndex >= 0) {
++      build = int.tryParse(value.substring(buildIndex + 1)) ?? 0;
++      value = value.substring(0, buildIndex);
++    }
++    int? pre;
++    final preMatch = RegExp(
++      r'-(?:pre|beta|rc)\.?(\d*)$',
++      caseSensitive: false,
++    ).firstMatch(value);
++    if (preMatch != null) {
++      final digits = preMatch.group(1);
++      pre = digits == null || digits.isEmpty ? 0 : int.tryParse(digits) ?? 0;
++      value = value.substring(0, preMatch.start);
++    }
++    final parts = value.split('.');
++    int at(int index) =>
++        index < parts.length ? int.tryParse(parts[index].trim()) ?? 0 : 0;
++    return _SemVer(at(0), at(1), at(2), pre, build);
++  }
++}
 diff --git a/lib/controller.dart b/lib/controller.dart
-index 566230f..6d11636 100644
+index 566230f..2bc4e9e 100644
 --- a/lib/controller.dart
 +++ b/lib/controller.dart
-@@ -1172,9 +1172,9 @@ class AppController {
+@@ -1172,9 +1172,15 @@ class AppController {
  
      if (!isAutoCheck && !forceCheck) return;
  
 -    final res = await request.checkForUpdate();
-+    final res = await request.checkForUpdate(repo: forkRepository);
++    final Map<String, dynamic>? res;
++    try {
++      res = await request.checkForUpdate(repo: forkRepository);
++    } catch (e) {
++      commonPrint.warn('checkForUpdate failed: ${e.formatErrorLog}');
++      return;
++    }
      if (res != null) {
 -      checkUpdateResultHandle(data: res);
 +      checkUpdateResultHandle(data: res, repo: forkRepository);
      }
  
      await prefs?.setInt('last_check_update_time', now);
-@@ -1183,10 +1183,8 @@ class AppController {
+@@ -1183,10 +1189,8 @@ class AppController {
    Future<void> checkUpdateResultHandle({
      Map<String, dynamic>? data,
      bool handleError = false,
@@ -186,7 +224,7 @@ index 566230f..6d11636 100644
      if (data != null) {
        final tagName = data['tag_name'];
        final body = data['body'];
-@@ -1209,7 +1207,7 @@ class AppController {
+@@ -1209,7 +1213,7 @@ class AppController {
          return;
        }
        const String assetSuffix = String.fromEnvironment('APP_ASSET_SUFFIX');
@@ -195,7 +233,7 @@ index 566230f..6d11636 100644
  
        if (assetSuffix.isNotEmpty) {
          final versionWithoutV = tagName.startsWith('v')
-@@ -1220,7 +1218,7 @@ class AppController {
+@@ -1220,7 +1224,7 @@ class AppController {
            finalSuffix = 'windows-amd64-compatible-portable.zip';
          }
          downloadUrl =
@@ -205,26 +243,36 @@ index 566230f..6d11636 100644
  
        globalState.openUrl(downloadUrl);
 diff --git a/lib/views/about.dart b/lib/views/about.dart
-index 1ac6738..3928404 100644
+index 1ac6738..eb2e489 100644
 --- a/lib/views/about.dart
 +++ b/lib/views/about.dart
-@@ -23,13 +23,14 @@ class AboutView extends StatelessWidget {
+@@ -22,14 +22,19 @@ class AboutView extends StatelessWidget {
+   Future<void> _checkUpdate(BuildContext context) async {
      final commonScaffoldState = context.commonScaffoldState;
      if (commonScaffoldState?.mounted != true) return;
-     final data = await globalState.appController.safeRun<Map<String, dynamic>?>(
+-    final data = await globalState.appController.safeRun<Map<String, dynamic>?>(
 -      request.checkForUpdate,
-+      () => request.checkForUpdate(repo: forkRepository),
-       title: appLocalizations.checkUpdate,
-       needLoading: true,
-     );
+-      title: appLocalizations.checkUpdate,
+-      needLoading: true,
+-    );
++    // 用记录包一层，才能区分“已是最新”（release 为 null）与“请求失败”（整体为 null）
++    final result = await globalState.appController
++        .safeRun<({Map<String, dynamic>? release})>(
++          () async =>
++              (release: await request.checkForUpdate(repo: forkRepository)),
++          title: appLocalizations.checkUpdate,
++          needLoading: true,
++        );
++    if (result == null) return;
      globalState.appController.checkUpdateResultHandle(
-       data: data,
+-      data: data,
++      data: result.release,
        handleError: true,
 +      repo: forkRepository,
      );
    }
  
-@@ -70,6 +71,16 @@ class AboutView extends StatelessWidget {
+@@ -70,6 +75,16 @@ class AboutView extends StatelessWidget {
          icon: Icons.memory,
          onTap: () => globalState.openUrl('https://github.com/MetaCubeX/mihomo'),
        ),
