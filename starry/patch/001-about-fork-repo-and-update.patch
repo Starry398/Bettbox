@@ -1,8 +1,7 @@
 diff --git a/lib/common/constant.dart b/lib/common/constant.dart
 --- a/lib/common/constant.dart
 +++ b/lib/common/constant.dart
-@@ -44,6 +44,7 @@ const customSidebarIconKey = 'custom_sidebar_icon';
- const customDashboardTitleKey = 'custom_dashboard_title';
+@@ -45,6 +45,7 @@ const customDashboardTitleKey = 'custom_dashboard_title';
  const double dialogCommonWidth = 300;
  const repository = 'appshubcc/Bettbox';
 +const forkRepository = 'Starry398/Bettbox';
@@ -12,10 +11,21 @@ diff --git a/lib/common/constant.dart b/lib/common/constant.dart
 diff --git a/lib/common/request.dart b/lib/common/request.dart
 --- a/lib/common/request.dart
 +++ b/lib/common/request.dart
-@@ -254,40 +254,120 @@ class Request {
-     return MemoryImage(bytes);
-   }
+@@ -13,6 +13,15 @@ import 'package:cupertino_ui/cupertino_ui.dart';
 
++class _UpdateVersion {
++  final int major;
++  final int minor;
++  final int patch;
++  final int? pre;
++
++  const _UpdateVersion(this.major, this.minor, this.patch, this.pre);
++}
++
+ class Request {
+   late final Dio _dio;
+   late final Dio _clashDio;
+@@ -254,35 +263,83 @@ class Request {
 -  Future<Map<String, dynamic>?> checkForUpdate() async {
 +  Future<Map<String, dynamic>?> checkForUpdate({
 +    String repo = repository,
@@ -28,21 +38,16 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 -          followRedirects: false,
 -          validateStatus: (status) =>
 -              status != null && status >= 300 && status < 400,
-+      final current = _parseUpdateVersion(
-+        globalState.packageInfo.version,
-+      );
+-        ),
++      final current = _parseUpdateVersion(globalState.packageInfo.version);
 +      if (current == null) return null;
 +
 +      final response = await _dio.get<List<dynamic>>(
 +        'https://api.github.com/repos/$repo/releases',
-+        queryParameters: {
-+          'per_page': 100,
-+          'page': 1,
-+          't': DateTime.now().millisecondsSinceEpoch,
-+        },
++        queryParameters: {'per_page': 100, 'page': 1},
 +        options: Options(
 +          headers: {'Accept': 'application/vnd.github+json'},
-         ),
++        ),
        );
 -      final location = response.headers['location']?.firstOrNull;
 -      if (location != null && location.contains('/releases/tag/')) {
@@ -62,42 +67,33 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 -            'body': 'New version available. Please visit GitHub to download.',
 -          };
 -        }
-+ 
-+      final releases = response.data;
-+      if (releases == null || releases.isEmpty) return null;
 +
 +      final candidates = <Map<String, dynamic>>[];
-+      for (final item in releases) {
-+        if (item is! Map<String, dynamic>) continue;
-+        if (item['draft'] == true) continue;
-+
-+        final tag = item['tag_name']?.toString().trim() ?? '';
-+        final candidate = _parseUpdateVersion(tag);
-+        if (candidate == null) continue;
-+
-+        if (!current.isPreRelease && candidate.isPreRelease) {
++      for (final item in response.data ?? <dynamic>[]) {
++        if (item is! Map<String, dynamic> || item['draft'] == true) {
 +          continue;
 +        }
++        final tag = item['tag_name']?.toString() ?? '';
++        final version = _parseUpdateVersion(tag);
++        if (version == null) continue;
 +
++        final core = _compareCore(version, current);
++        if (!current.isPreRelease && version.isPreRelease) continue;
 +        if (current.isPreRelease &&
-+            !candidate.isPreRelease &&
-+            _compareCore(candidate, current) == 0) {
++            !version.isPreRelease &&
++            core == 0) {
 +          continue;
 +        }
-+
-+        if (_compareUpdateVersions(candidate, current) <= 0) {
-+          continue;
++        if (_compareUpdateVersion(version, current) > 0) {
++          candidates.add(item);
 +        }
-+
-+        candidates.add(item);
        }
 +
 +      if (candidates.isEmpty) return null;
-+
 +      candidates.sort((a, b) {
 +        final av = _parseUpdateVersion(a['tag_name'].toString())!;
 +        final bv = _parseUpdateVersion(b['tag_name'].toString())!;
-+        return _compareUpdateVersions(bv, av);
++        return _compareUpdateVersion(bv, av);
 +      });
 +
 +      final latest = candidates.first;
@@ -117,23 +113,16 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 +  _UpdateVersion? _parseUpdateVersion(String raw) {
 +    var value = raw.trim();
 +    if (value.startsWith('v')) value = value.substring(1);
-+
 +    final match = RegExp(
-+      r'^(\d+)\.(\d+)\.(\d+)(?:-pre\.?(\d+))?(?:\+(\d+))?$',
++      r'^(\d+)\.(\d+)\.(\d+)(?:-pre\.?(\d+))?$',
 +      caseSensitive: false,
 +    ).firstMatch(value);
 +    if (match == null) return null;
-+
 +    return _UpdateVersion(
-+      major: int.parse(match.group(1)!),
-+      minor: int.parse(match.group(2)!),
-+      patch: int.parse(match.group(3)!),
-+      preReleaseNumber: match.group(4) == null
-+          ? null
-+          : int.parse(match.group(4)!),
-+      buildNumber: match.group(5) == null
-+          ? 0
-+          : int.parse(match.group(5)!),
++      int.parse(match.group(1)!),
++      int.parse(match.group(2)!),
++      int.parse(match.group(3)!),
++      match.group(4) == null ? null : int.parse(match.group(4)!),
 +    );
 +  }
 +
@@ -145,47 +134,24 @@ diff --git a/lib/common/request.dart b/lib/common/request.dart
 +    return a.patch.compareTo(b.patch);
 +  }
 +
-+  int _compareUpdateVersions(_UpdateVersion a, _UpdateVersion b) {
++  int _compareUpdateVersion(_UpdateVersion a, _UpdateVersion b) {
 +    final core = _compareCore(a, b);
 +    if (core != 0) return core;
-+
-+    if (a.isPreRelease && b.isPreRelease) {
-+      return a.preReleaseNumber!.compareTo(b.preReleaseNumber!);
++    if (a.pre != null && b.pre != null) {
++      return a.pre!.compareTo(b.pre!);
 +    }
-+
-+    if (a.isPreRelease && !b.isPreRelease) return -1;
-+    if (!a.isPreRelease && b.isPreRelease) return 1;
-+    return a.buildNumber.compareTo(b.buildNumber);
++    if (a.pre != null) return -1;
++    if (b.pre != null) return 1;
++    return 0;
 +  }
 +
    List<String> _getPrimaryIpSources() {
      final locale = Intl.getCurrentLocale().toLowerCase();
      final isZh = locale.startsWith('zh');
-@@ -1000,2 +1080,20 @@ class Request {
-   }
- }
-
-+class _UpdateVersion {
-+  final int major;
-+  final int minor;
-+  final int patch;
-+  final int? preReleaseNumber;
-+  final int buildNumber;
-+
-+  const _UpdateVersion({
-+    required this.major,
-+    required this.minor,
-+    required this.patch,
-+    required this.preReleaseNumber,
-+    required this.buildNumber,
-+  });
-+
-+  bool get isPreRelease => preReleaseNumber != null;
-+}
 diff --git a/lib/controller.dart b/lib/controller.dart
 --- a/lib/controller.dart
 +++ b/lib/controller.dart
-@@ -1174,5 +1174,5 @@ class AppController {
+@@ -1174,9 +1174,9 @@
 -    final res = await request.checkForUpdate();
 +    final res = await request.checkForUpdate(repo: forkRepository);
      if (res != null) {
@@ -194,15 +160,19 @@ diff --git a/lib/controller.dart b/lib/controller.dart
      }
 
      await prefs?.setInt('last_check_update_time', now);
-@@ -1185,8 +1185,9 @@ class AppController {
+@@ -1184,11 +1184,10 @@
    Future<void> checkUpdateResultHandle({
      Map<String, dynamic>? data,
      bool handleError = false,
 +    String repo = repository,
    }) async {
-     if (globalState.isPre && !handleError) {
-       return;
-@@ -1209,5 +1210,5 @@ class AppController {
+-    if (globalState.isPre && !handleError) {
+-      return;
+-    }
+     if (data != null) {
+       final tagName = data['tag_name'];
+       final body = data['body'];
+@@ -1209,7 +1208,7 @@
        }
        const String assetSuffix = String.fromEnvironment('APP_ASSET_SUFFIX');
 -      String downloadUrl = 'https://github.com/$repository/releases/latest';
@@ -210,7 +180,7 @@ diff --git a/lib/controller.dart b/lib/controller.dart
 
        if (assetSuffix.isNotEmpty) {
          final versionWithoutV = tagName.startsWith('v')
-@@ -1220,6 +1221,6 @@ class AppController {
+@@ -1220,7 +1219,7 @@
            finalSuffix = 'windows-amd64-compatible-portable.zip';
          }
          downloadUrl =
@@ -221,30 +191,27 @@ diff --git a/lib/controller.dart b/lib/controller.dart
 diff --git a/lib/views/about.dart b/lib/views/about.dart
 --- a/lib/views/about.dart
 +++ b/lib/views/about.dart
-@@ -33,7 +33,7 @@ class AboutView extends StatelessWidget {
-     final commonScaffoldState = context.commonScaffoldState;
-     if (commonScaffoldState?.mounted != true) return;
-     final data = await globalState.appController.safeRun<Map<String, dynamic>?>(
+@@ -25,7 +25,7 @@
 -      request.checkForUpdate,
 +      () => request.checkForUpdate(repo: forkRepository),
        title: appLocalizations.checkUpdate,
        needLoading: true,
      );
-@@ -41,5 +41,6 @@ class AboutView extends StatelessWidget {
+@@ -34,6 +34,7 @@
      globalState.appController.checkUpdateResultHandle(
        data: data,
        handleError: true,
 +      repo: forkRepository,
      );
-   }
-
-@@ -70,4 +71,14 @@ class AboutView extends StatelessWidget {
+@@ -64,6 +65,14 @@
+         prefix: 'Powered by',
+         title: 'Mihomo',
          icon: Icons.memory,
          onTap: () => globalState.openUrl('https://github.com/MetaCubeX/mihomo'),
        ),
 +      _LinkTile(
 +        title: '我的 GitHub 仓库',
-+        icon: Icons.fork_right,
++        icon: Icons.code,
 +        onTap: () => globalState.openUrl('https://github.com/$forkRepository'),
 +      ),
 +      _LinkTile(
