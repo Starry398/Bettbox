@@ -1,5 +1,4 @@
 diff --git a/lib/common/constant.dart b/lib/common/constant.dart
-index dcfff980..0a69b1f5 100644
 --- a/lib/common/constant.dart
 +++ b/lib/common/constant.dart
 @@ -44,6 +44,7 @@ const customSidebarIconKey = 'custom_sidebar_icon';
@@ -11,51 +10,205 @@ index dcfff980..0a69b1f5 100644
  const defaultExternalController = '127.0.0.1:9090';
  const maxMobileWidth = 600;
 diff --git a/lib/common/request.dart b/lib/common/request.dart
-index 32002723..edcdd164 100644
 --- a/lib/common/request.dart
 +++ b/lib/common/request.dart
-@@ -254,11 +254,11 @@ class Request {
+@@ -254,31 +254,91 @@ class Request {
      return MemoryImage(bytes);
    }
- 
+
 -  Future<Map<String, dynamic>?> checkForUpdate() async {
-+  Future<Map<String, dynamic>?> checkForUpdate({String repo = repository}) async {
++  Future<Map<String, dynamic>?> checkForUpdate({
++    String repo = repository,
++  }) async {
      try {
-       final t = DateTime.now().millisecondsSinceEpoch;
-       final response = await _dio.get(
+-      final t = DateTime.now().millisecondsSinceEpoch;
+-      final response = await _dio.get(
 -        'https://github.com/$repository/releases/latest?t=$t',
-+        'https://github.com/$repo/releases/latest?t=$t',
-         options: Options(
-           followRedirects: false,
-           validateStatus: (status) =>
-@@ -279,7 +279,7 @@ class Request {
-           if (!hasUpdate) return null;
-           return {
-             'tag_name': remoteVersion,
+-        options: Options(
+-          followRedirects: false,
+-          validateStatus: (status) =>
+-              status != null && status >= 300 && status < 400,
+-        ),
++      final version = globalState.packageInfo.version;
++      final current = _parseUpdateVersion(version);
++      if (current == null) return null;
++
++      final response = await _dio.get<List<dynamic>>(
++        'https://api.github.com/repos/$repo/releases',
++        queryParameters: {
++          'per_page': 100,
++          'page': 1,
++          't': DateTime.now().millisecondsSinceEpoch,
++        },
++        options: Options(
++          headers: {
++            'Accept': 'application/vnd.github+json',
++          },
++        ),
+       );
+-      final location = response.headers['location']?.firstOrNull;
+-      if (location != null && location.contains('/releases/tag/')) {
+-        final remoteVersion = location.split('/').last.trim();
+-        if (remoteVersion.isNotEmpty) {
+-          final version = globalState.packageInfo.version;
+-          final hasUpdate =
+-              utils.compareVersions(
+-                remoteVersion.replaceAll('v', ''),
+-                version,
+-              ) >
+-              0;
+-          if (!hasUpdate) return null;
+-          return {
+-            'tag_name': remoteVersion,
 -            'html_url': 'https://github.com/$repository/releases/latest',
-+            'html_url': 'https://github.com/$repo/releases/latest',
-             'body': 'New version available. Please visit GitHub to download.',
-           };
-         }
+-            'body': 'New version available. Please visit GitHub to download.',
+-          };
+-        }
++
++      final releases = response.data;
++      if (releases == null || releases.isEmpty) return null;
++
++      final candidates = <Map<String, dynamic>>[];
++      for (final item in releases) {
++        if (item is! Map<String, dynamic>) continue;
++        if (item['draft'] == true) continue;
++
++        final tag = item['tag_name']?.toString().trim() ?? '';
++        if (tag.isEmpty) continue;
++
++        final candidate = _parseUpdateVersion(tag);
++        if (candidate == null) continue;
++
++        // 正式版只接收更高的正式版。
++        if (!current.isPreRelease && candidate.isPreRelease) continue;
++
++        // 预发布版不接受相同 core 版本的正式版。
++        if (current.isPreRelease &&
++            !candidate.isPreRelease &&
++            _compareCore(candidate, current) == 0) {
++          continue;
++        }
++
++        if (_compareUpdateVersions(candidate, current) <= 0) continue;
++
++        candidates.add(item);
+       }
++
++      if (candidates.isEmpty) return null;
++
++      candidates.sort((a, b) {
++        final av = _parseUpdateVersion(a['tag_name'].toString())!;
++        final bv = _parseUpdateVersion(b['tag_name'].toString())!;
++        return _compareUpdateVersions(bv, av);
++      });
++
++      final latest = candidates.first;
++      return {
++        'tag_name': latest['tag_name'],
++        'html_url': latest['html_url'] ??
++            'https://github.com/$repo/releases',
++        'body': latest['body'] ??
++            'New version available. Please visit GitHub to download.',
++      };
+     } catch (e) {
+       commonPrint.warn('Check update failed: ${e.formatErrorLog}');
+     }
+     return null;
+   }
+
++  _UpdateVersion? _parseUpdateVersion(String raw) {
++    var value = raw.trim();
++    if (value.startsWith('v')) value = value.substring(1);
++
++    final match = RegExp(
++      r'^(\d+)\.(\d+)\.(\d+)(?:-pre[.]?(\d+))?(?:\+(\d+))?$',
++      caseSensitive: false,
++    ).firstMatch(value);
++    if (match == null) return null;
++
++    return _UpdateVersion(
++      major: int.parse(match.group(1)!),
++      minor: int.parse(match.group(2)!),
++      patch: int.parse(match.group(3)!),
++      preReleaseNumber: match.group(4) == null
++          ? null
++          : int.parse(match.group(4)!),
++      buildNumber: match.group(5) == null
++          ? 0
++          : int.parse(match.group(5)!),
++    );
++  }
++
++  int _compareCore(_UpdateVersion a, _UpdateVersion b) {
++    final major = a.major.compareTo(b.major);
++    if (major != 0) return major;
++    final minor = a.minor.compareTo(b.minor);
++    if (minor != 0) return minor;
++    return a.patch.compareTo(b.patch);
++  }
++
++  int _compareUpdateVersions(_UpdateVersion a, _UpdateVersion b) {
++    final core = _compareCore(a, b);
++    if (core != 0) return core;
++
++    if (a.isPreRelease && b.isPreRelease) {
++      return a.preReleaseNumber!.compareTo(b.preReleaseNumber!);
++    }
++
++    if (a.isPreRelease && !b.isPreRelease) return -1;
++    if (!a.isPreRelease && b.isPreRelease) return 1;
++    return a.buildNumber.compareTo(b.buildNumber);
++  }
++
++}
++
++class _UpdateVersion {
++  final int major;
++  final int minor;
++  final int patch;
++  final int? preReleaseNumber;
++  final int buildNumber;
++
++  const _UpdateVersion({
++    required this.major,
++    required this.minor,
++    required this.patch,
++    required this.preReleaseNumber,
++    required this.buildNumber,
++  });
++
++  bool get isPreRelease => preReleaseNumber != null;
++}
++
 diff --git a/lib/controller.dart b/lib/controller.dart
-index 566230fb..575ff8ec 100644
 --- a/lib/controller.dart
 +++ b/lib/controller.dart
-@@ -1183,6 +1183,7 @@ class AppController {
+@@ -1174,10 +1174,10 @@ class AppController {
+-    final res = await request.checkForUpdate();
++    final res = await request.checkForUpdate(repo: forkRepository);
+     if (res != null) {
+-      checkUpdateResultHandle(data: res);
++      checkUpdateResultHandle(data: res, repo: forkRepository);
+     }
+
+     await prefs?.setInt('last_check_update_time', now);
+@@ -1185,8 +1185,9 @@ class AppController {
    Future<void> checkUpdateResultHandle({
      Map<String, dynamic>? data,
      bool handleError = false,
 +    String repo = repository,
    }) async {
-     if (globalState.isPre && !handleError) {
+-    if (globalState.isPre && !handleError) {
++    if (false && globalState.isPre && !handleError) {
        return;
+     }
+     if (data != null) {
 @@ -1209,7 +1210,7 @@ class AppController {
-         return;
        }
        const String assetSuffix = String.fromEnvironment('APP_ASSET_SUFFIX');
 -      String downloadUrl = 'https://github.com/$repository/releases/latest';
 +      String downloadUrl = 'https://github.com/$repo/releases/latest';
- 
+
        if (assetSuffix.isNotEmpty) {
          final versionWithoutV = tagName.startsWith('v')
 @@ -1220,7 +1221,7 @@ class AppController {
@@ -65,16 +218,15 @@ index 566230fb..575ff8ec 100644
 -            'https://github.com/$repository/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
 +            'https://github.com/$repo/releases/download/$tagName/Bettbox-$versionWithoutV-$finalSuffix';
        }
- 
+
        globalState.openUrl(downloadUrl);
 diff --git a/lib/views/about.dart b/lib/views/about.dart
-index 1ac6738a..96a04618 100644
 --- a/lib/views/about.dart
 +++ b/lib/views/about.dart
 @@ -33,6 +33,21 @@ class AboutView extends StatelessWidget {
      );
    }
- 
+
 +  Future<void> _checkForkUpdate(BuildContext context) async {
 +    final commonScaffoldState = context.commonScaffoldState;
 +    if (commonScaffoldState?.mounted != true) return;
