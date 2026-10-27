@@ -1,3 +1,4 @@
+
 name: Shared
 
 on:
@@ -101,7 +102,7 @@ jobs:
             starry/txt/versioncode.txt
           sparse-checkout-cone-mode: false
 
-      # 5. 覆盖自定义 XML 资源
+      # 5. 覆盖自定义 XML 资源（根目录 → res/drawable，子目录按同名映射到 res/<dir>）
       - name: Restore custom XML resources
         working-directory: upstream
         shell: bash
@@ -109,7 +110,7 @@ jobs:
           set -euo pipefail
 
           SOURCE="../custom-files/starry/xml"
-          TARGET="android/app/src/main/res/drawable"
+          TARGET="android/app/src/main/res"
 
           test -d "$SOURCE" || {
             echo "::error::Custom XML directory not found: $SOURCE"
@@ -117,25 +118,41 @@ jobs:
           }
 
           test -d "$TARGET" || {
-            echo "::error::Upstream drawable directory not found: $TARGET"
+            echo "::error::Upstream res directory not found: $TARGET"
             exit 1
           }
 
           XML_COUNT=0
 
+          # starry/xml 根目录下的文件落到 res/drawable（保持原有平铺规则）；
+          # 子目录会镜像到同名 res 目录，例如
+          # starry/xml/mipmap-anydpi-v26/ic_launcher.xml → res/mipmap-anydpi-v26/ic_launcher.xml，
+          # 这样覆盖自适应图标（含 monochrome 层）不需要改这段脚本。
           while IFS= read -r -d '' file; do
-            filename=$(basename "$file")
+            rel="${file#"$SOURCE"/}"
+
+            case "$rel" in
+              *..*) echo "::error::Unsafe resource path: $rel"; exit 1 ;;
+            esac
+
+            filename=$(basename "$rel")
 
             if ! [[ "$filename" =~ ^[a-z0-9_]+\.xml$ ]]; then
               echo "::error::Invalid Android resource filename: $filename"
               exit 1
             fi
 
-            cp -f "$file" "$TARGET/$filename"
-            echo "Restored XML: $filename"
+            case "$rel" in
+              */*) dest_dir="$TARGET/$(dirname "$rel")" ;;
+              *) dest_dir="$TARGET/drawable" ;;
+            esac
+
+            mkdir -p "$dest_dir"
+            cp -f "$file" "$dest_dir/$filename"
+            echo "Restored XML: $rel -> ${dest_dir#"$TARGET"/}"
             XML_COUNT=$((XML_COUNT + 1))
           done < <(
-            find "$SOURCE" -maxdepth 1 -type f -name '*.xml' -print0
+            find "$SOURCE" -type f -name '*.xml' -print0
           )
 
           echo "Restored $XML_COUNT custom XML file(s)."
